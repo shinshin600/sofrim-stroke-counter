@@ -1,406 +1,506 @@
 # -*- coding: utf-8 -*-
-"""Real-time quill stroke counter for sofrim.
+"""Interactive quill stroke counter for sofrim.
 
-This module provides an interactive OpenCV application that detects the quill tip
-using two coloured rings, locks the writing surface via ArUco markers and counts
-strokes based on fresh ink appearance in the vicinity of the quill tip.
-
-The implementation is designed to run on Windows but works on any platform where
-OpenCV can access a camera.
+This script locks onto a parchment using ArUco markers, tracks two coloured rings
+on the quill and counts writing strokes by monitoring fresh ink deposition near the
+quill tip. It targets Windows with Python 3.12 but works anywhere OpenCV can access a
+camera.
 """
 from __future__ import annotations
 
 import argparse
-import collections
 import json
 import time
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import cv2
 import numpy as np
 
 
-CONFIG_FILE = "config.json"
+if not hasattr(cv2, "aruco"):
+    raise ImportError(
+        "cv2.aruco is unavailable. Install the 'opencv-contrib-python' package to "
+        "enable ArUco marker support."
+    )
+
+
+CONFIG_FILENAME = "config.json"
 WINDOW_TITLE = "Sofrim Stroke Counter"
+CALIBRATION_WINDOW = "HSV Calibration"
+
 CAMERA_INDEX = 0
 FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1080
 FRAME_FPS = 30
 
-# ArUco marker IDs expected for the four corners of the parchment
-CORNER_IDS = {
-    10: "top_left",
-    11: "top_right",
-    12: "bottom_right",
-    13: "bottom_left",
-}
-
-# Dimensions of the parchment area (in millimetres) used for the homography
-# These values can be adjusted to match the real parchment size
-PARCHMENT_WIDTH_MM = 300.0
-PARCHMENT_HEIGHT_MM = 200.0
-
-# Rolling buffer size for ink activity smoothing
-INK_BUFFER_SIZE = 15
-
-# Size of the ROI (in millimetres) around the quill tip used for ink detection
-ROI_HALF_SIZE_MM = 4.0
-
-# Distance from ring A (yellow) to the tip in millimetres
-TIP_OFFSET_MM = 10.0
-
-# Radius of refine counter area in millimetres
-REFINE_RADIUS_MM = 0.8
-
-# Location of refine counter area (centre in millimetres relative to parchment origin)
-REFINE_CENTER_MM = (PARCHMENT_WIDTH_MM / 2.0, PARCHMENT_HEIGHT_MM / 2.0)
+PREFERRED_DICTIONARY = cv2.aruco.DICT_4X4_1000
+MARKER_IDS = list(range(10, 18))
 
 
 @dataclass
-class RingThreshold:
-    """HSV range for a ring."""
+class RingHSVConfig:
+    """HSV threshold ranges for a coloured ring."""
 
-    low: np.ndarray
-    high: np.ndarray
+    low: Tuple[int, int, int]
+    high: Tuple[int, int, int]
 
     @staticmethod
-    def from_dict(data: Dict[str, Iterable[int]]) -> "RingThreshold":
-        return RingThreshold(
-            low=np.array(list(data["low"]), dtype=np.uint8),
-            high=np.array(list(data["high"]), dtype=np.uint8),
+    def from_mapping(mapping: Dict[str, Iterable[int]]) -> "RingHSVConfig":
+        return RingHSVConfig(
+            low=tuple(int(v) for v in mapping["low"]),
+            high=tuple(int(v) for v in mapping["high"]),
+        )
+
+    def as_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        return (
+            np.array(self.low, dtype=np.uint8),
+            np.array(self.high, dtype=np.uint8),
         )
 
 
 @dataclass
-class RingDetection:
-    """Result of detecting a ring."""
+class AppConfig:
+    """Runtime configuration loaded from JSON."""
 
-    centre_px: Optional[np.ndarray]
-    contour: Optional[np.ndarray]
+    ringA: RingHSVConfig
+    ringB: RingHSVConfig
+    smoothing_window: int = 32
+    threshold_on: float = 14.0
+    threshold_off: float = 7.0
+    parchment_width_mm: float = 400.0
+    parchment_height_mm: float = 300.0
+    roi_half_size_mm: float = 3.0
+    refine_radius_mm: float = 0.8
+    ring_tip_offset_mm: float = 10.0
+    ring_spacing_mm: float = 10.0
 
-    def is_valid(self) -> bool:
-        return self.centre_px is not None
+    @staticmethod
+    def from_json(path: Path) -> "AppConfig":
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+
+        ring_a = RingHSVConfig.from_mapping(data["ringA"])
+        ring_b = RingHSVConfig.from_mapping(data["ringB"])
+        return AppConfig(ringA=ring_a, ringB=ring_b)
+
+    def to_json(self) -> Dict[str, Dict[str, Tuple[int, int, int]]]:
+        return {
+            "ringA": {"low": list(self.ringA.low), "high": list(self.ringA.high)},
+            "ringB": {"low": list(self.ringB.low), "high": list(self.ringB.high)},
+        }
 
 
 @dataclass
-class TrackingState:
-    homography_px_from_mm: Optional[np.ndarray] = None
+class MarkerLock:
+    """Stores the current homography and detected marker centres."""
+
     homography_mm_from_px: Optional[np.ndarray] = None
-    strokes: int = 0
+    homography_px_from_mm: Optional[np.ndarray] = None
+    markers: Dict[int, np.ndarray] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self.homography_mm_from_px = None
+        self.homography_px_from_mm = None
+        self.markers.clear()
+
+    def locked(self) -> bool:
+        return self.homography_mm_from_px is not None and self.homography_px_from_mm is not None
+
+
+@dataclass
+class InkActivityTracker:
+    """Maintains a smoothed ink activity signal and pen state."""
+
+    threshold_on: float
+    threshold_off: float
+    window_size: int
+    queue: Deque[float] = field(default_factory=lambda: deque(maxlen=32))
+    previous_roi: Optional[np.ndarray] = None
+    previous_shape: Optional[Tuple[int, int]] = None
     pen_down: bool = False
-    refine_count: int = 0
-    inside_refine: bool = False
-    last_screenshot_time: float = 0.0
-    ink_activity_queue: Deque[float] = collections.deque(maxlen=INK_BUFFER_SIZE)
+
+    def update(self, roi_gray: Optional[np.ndarray]) -> Tuple[bool, float]:
+        if roi_gray is None:
+            self.clear()
+            return False, 0.0
+
+        if self.queue.maxlen != self.window_size:
+            self.queue = deque(self.queue, maxlen=self.window_size)
+
+        activity = 0.0
+        if self.previous_roi is not None and self.previous_shape == roi_gray.shape:
+            diff = cv2.absdiff(roi_gray, self.previous_roi)
+            activity = float(np.mean(diff))
+
+        self.previous_roi = roi_gray.copy()
+        self.previous_shape = roi_gray.shape
+        self.queue.append(activity)
+
+        smoothed = float(np.mean(self.queue)) if self.queue else 0.0
+
+        if self.pen_down:
+            if smoothed < self.threshold_off:
+                self.pen_down = False
+        else:
+            if smoothed > self.threshold_on:
+                self.pen_down = True
+
+        return self.pen_down, smoothed
+
+    def clear(self) -> None:
+        self.queue.clear()
+        self.previous_roi = None
+        self.previous_shape = None
+        self.pen_down = False
 
 
-def load_config(config_path: Path) -> Dict[str, RingThreshold]:
-    """Load HSV threshold configuration for the quill rings."""
+@dataclass
+class StrokeCounter:
+    """Counts strokes and refine oscillations."""
 
-    if not config_path.exists():
+    strokes: int = 0
+    refine: int = 0
+    pen_down: bool = False
+    circle_center_mm: Optional[np.ndarray] = None
+    inside_circle: Optional[bool] = None
+
+    def update(self, pen_down: bool, tip_mm: Optional[np.ndarray], radius_mm: float) -> None:
+        if not pen_down or tip_mm is None:
+            if self.pen_down and not pen_down:
+                self.circle_center_mm = None
+                self.inside_circle = None
+            self.pen_down = pen_down
+            return
+
+        if not self.pen_down and pen_down:
+            self.strokes += 1
+            self.circle_center_mm = tip_mm.copy()
+            self.inside_circle = True
+        elif self.circle_center_mm is None:
+            self.circle_center_mm = tip_mm.copy()
+            self.inside_circle = True
+
+        if self.circle_center_mm is not None:
+            distance = float(np.linalg.norm(tip_mm - self.circle_center_mm))
+            inside = distance <= radius_mm
+            if self.inside_circle is None:
+                self.inside_circle = inside
+            elif inside != self.inside_circle:
+                self.refine += 1
+                self.inside_circle = inside
+
+        self.pen_down = pen_down
+
+    def reset(self) -> None:
+        self.strokes = 0
+        self.refine = 0
+        self.pen_down = False
+        self.circle_center_mm = None
+        self.inside_circle = None
+
+
+class HSVCalibrator:
+    """Trackbar-based calibration UI for HSV ranges."""
+
+    _instance: Optional["HSVCalibrator"] = None
+
+    def __init__(self, window_name: str, config_path: Path, config: AppConfig) -> None:
+        HSVCalibrator._instance = self
+        self.window_name = window_name
+        self.config_path = config_path
+        self.config = config
+        self._suspend = False
+
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, 480, 240)
+
+        self._suspend = True
+        for ring_name, ring_cfg in ("ringA", self.config.ringA), ("ringB", self.config.ringB):
+            for bound_name in ("low", "high"):
+                values = getattr(ring_cfg, bound_name)
+                for channel, max_value, initial in zip("HSV", (179, 255, 255), values):
+                    trackbar_name = f"{ring_name}_{bound_name}_{channel}"
+                    cv2.createTrackbar(
+                        trackbar_name,
+                        self.window_name,
+                        int(initial),
+                        max_value,
+                        HSVCalibrator._trackbar_callback,
+                    )
+        self._suspend = False
+        self._update_config(save=False)
+
+    @staticmethod
+    def _trackbar_callback(_: int) -> None:
+        if HSVCalibrator._instance is not None:
+            HSVCalibrator._instance._handle_trackbar_change()
+
+    def _handle_trackbar_change(self) -> None:
+        if self._suspend:
+            return
+        self._update_config(save=True)
+
+    def _update_config(self, save: bool) -> None:
+        for ring_attr in ("ringA", "ringB"):
+            low = []
+            high = []
+            for channel, max_value in zip("HSV", (179, 255, 255)):
+                low_name = f"{ring_attr}_low_{channel}"
+                high_name = f"{ring_attr}_high_{channel}"
+                low.append(cv2.getTrackbarPos(low_name, self.window_name))
+                high.append(cv2.getTrackbarPos(high_name, self.window_name))
+            setattr(
+                self.config,
+                ring_attr,
+                RingHSVConfig(low=tuple(low), high=tuple(high)),
+            )
+        if save:
+            self.save()
+
+    def save(self) -> None:
+        data = self.config.to_json()
+        with self.config_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+
+
+def ensure_config(path: Path) -> AppConfig:
+    if not path.exists():
         raise FileNotFoundError(
-            f"Configuration file '{config_path}' not found. "
-            "Create it based on the example in the README."
+            f"Configuration file '{path}' is missing. Provide HSV ranges in JSON as documented."
         )
-    with config_path.open("r", encoding="utf-8") as fh:
-        config_data = json.load(fh)
-    return {
-        "ringA": RingThreshold.from_dict(config_data["ringA"]),
-        "ringB": RingThreshold.from_dict(config_data["ringB"]),
-    }
-
-
-def save_screenshot(frame: np.ndarray, output_dir: Path = Path("screenshots")) -> Path:
-    """Save a diagnostic screenshot with timestamp."""
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    filename = output_dir / f"snapshot-{timestamp}.png"
-    cv2.imwrite(str(filename), frame)
-    return filename
+    return AppConfig.from_json(path)
 
 
 def create_capture(index: int) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, FRAME_FPS)
-    return cap
+    capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    capture.set(cv2.CAP_PROP_FPS, FRAME_FPS)
+    return capture
 
 
-def detect_markers(frame: np.ndarray) -> Tuple[List[np.ndarray], List[int]]:
-    """Detect ArUco markers in the frame."""
-
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    parameters = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+def detect_markers(
+    frame: np.ndarray,
+    detector: cv2.aruco.ArucoDetector,
+) -> Dict[int, np.ndarray]:
     corners, ids, _ = detector.detectMarkers(frame)
+    marker_centres: Dict[int, np.ndarray] = {}
     if ids is None:
-        return [], []
-    return corners, ids.flatten().tolist()
-
-
-def compute_homography_from_markers(
-    corners: List[np.ndarray], ids: List[int]
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, np.ndarray]]:
-    """Compute homography matrices from detected marker corners."""
-
-    # Map of marker name to centre pixel coordinate
-    corner_map: Dict[str, np.ndarray] = {}
-
-    for marker_corners, marker_id in zip(corners, ids):
-        if marker_id in CORNER_IDS:
+        return marker_centres
+    for marker_corners, marker_id in zip(corners, ids.flatten().tolist()):
+        if marker_id in MARKER_IDS:
             pts = marker_corners.reshape(-1, 2)
-            centre = pts.mean(axis=0)
-            corner_map[CORNER_IDS[marker_id]] = centre
+            marker_centres[marker_id] = pts.mean(axis=0)
+    return marker_centres
 
-    if len(corner_map) < 4:
-        return None, None, corner_map
 
-    src_pts = np.array(
+def compute_homography(
+    centres: Dict[int, np.ndarray],
+    width_mm: float,
+    height_mm: float,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if not all(marker_id in centres for marker_id in MARKER_IDS[:4]):
+        return None, None
+
+    src = np.array(
         [
-            corner_map["top_left"],
-            corner_map["top_right"],
-            corner_map["bottom_right"],
-            corner_map["bottom_left"],
+            centres[10],
+            centres[11],
+            centres[12],
+            centres[13],
         ],
         dtype=np.float32,
     )
-
-    dst_pts = np.array(
+    dst = np.array(
         [
             [0.0, 0.0],
-            [PARCHMENT_WIDTH_MM, 0.0],
-            [PARCHMENT_WIDTH_MM, PARCHMENT_HEIGHT_MM],
-            [0.0, PARCHMENT_HEIGHT_MM],
+            [width_mm, 0.0],
+            [width_mm, height_mm],
+            [0.0, height_mm],
         ],
         dtype=np.float32,
     )
 
-    homography_mm_from_px, mask = cv2.findHomography(
-        src_pts, dst_pts, method=cv2.RANSAC
-    )
-    if homography_mm_from_px is None:
-        return None, None, corner_map
+    homography_mm_from_px, mask = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+    if homography_mm_from_px is None or mask is None:
+        return None, None
 
     homography_px_from_mm = np.linalg.inv(homography_mm_from_px)
+    return homography_mm_from_px, homography_px_from_mm
 
-    return homography_px_from_mm, homography_mm_from_px, corner_map
+
+def project_point(point: np.ndarray, homography: np.ndarray) -> np.ndarray:
+    pts = cv2.perspectiveTransform(point.reshape(-1, 1, 2).astype(np.float32), homography)
+    return pts.reshape(-1, 2)[0]
 
 
 def project_points(points: np.ndarray, homography: np.ndarray) -> np.ndarray:
-    """Apply perspective transform to a list of points."""
-
     pts = cv2.perspectiveTransform(points.reshape(-1, 1, 2).astype(np.float32), homography)
     return pts.reshape(-1, 2)
 
 
-def detect_ring(frame_hsv: np.ndarray, threshold: RingThreshold) -> RingDetection:
-    """Detect a coloured ring and return its centre."""
-
-    mask = cv2.inRange(frame_hsv, threshold.low, threshold.high)
+def detect_ring(frame_hsv: np.ndarray, threshold: RingHSVConfig) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    low, high = threshold.as_arrays()
+    mask = cv2.inRange(frame_hsv, low, high)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return RingDetection(None, None)
-
+        return None, None
     contour = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(contour)
-    if area < 50:  # Ignore tiny detections
-        return RingDetection(None, None)
-
+    if area < 50:
+        return None, None
     moments = cv2.moments(contour)
     if moments["m00"] == 0:
-        return RingDetection(None, None)
-
-    centre = np.array([
-        float(moments["m10"] / moments["m00"]),
-        float(moments["m01"] / moments["m00"]),
-    ])
-
-    return RingDetection(centre, contour)
+        return None, None
+    centre = np.array(
+        [moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]],
+        dtype=np.float32,
+    )
+    return centre, contour
 
 
-def mm_to_pixels(point_mm: np.ndarray, homography_px_from_mm: np.ndarray) -> np.ndarray:
-    """Convert a point from millimetres to pixel coordinates."""
-
-    pts_px = project_points(np.array([point_mm], dtype=np.float32), homography_px_from_mm)
-    return pts_px[0]
-
-
-def pixels_to_mm(point_px: np.ndarray, homography_mm_from_px: np.ndarray) -> np.ndarray:
-    """Convert a point from pixels to millimetres."""
-
-    pts_mm = project_points(np.array([point_px], dtype=np.float32), homography_mm_from_px)
-    return pts_mm[0]
-
-
-def compute_quill_tip(
+def compute_tip(
     ring_a_px: np.ndarray,
     ring_b_px: np.ndarray,
     homography_mm_from_px: np.ndarray,
     homography_px_from_mm: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute quill tip in both millimetres and pixels."""
-
-    ring_a_mm = pixels_to_mm(ring_a_px, homography_mm_from_px)
-    ring_b_mm = pixels_to_mm(ring_b_px, homography_mm_from_px)
-
-    direction = ring_a_mm - ring_b_mm
-    norm = np.linalg.norm(direction)
-    if norm < 1e-6:
-        raise ValueError("Ring positions are too close to determine direction")
-    v = direction / norm
-    tip_mm = ring_a_mm - v * TIP_OFFSET_MM
-
-    tip_px = mm_to_pixels(tip_mm, homography_px_from_mm)
-    return tip_mm, tip_px, v
-
-
-def compute_roi_pixels(
-    tip_mm: np.ndarray, homography_px_from_mm: np.ndarray
+    tip_offset_mm: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute top-left and bottom-right pixel coordinates of the ROI around the tip."""
+    ring_a_mm = project_point(ring_a_px, homography_mm_from_px)
+    ring_b_mm = project_point(ring_b_px, homography_mm_from_px)
+    direction = ring_b_mm - ring_a_mm
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        raise ValueError("Ring detections are degenerate; cannot estimate quill direction")
+    unit = direction / norm
+    tip_mm = ring_a_mm - unit * tip_offset_mm
+    tip_px = project_point(tip_mm, homography_px_from_mm)
+    return tip_mm, tip_px
 
+
+def warp_to_work_area(
+    frame: np.ndarray,
+    homography_mm_from_px: np.ndarray,
+    width_mm: float,
+    height_mm: float,
+) -> np.ndarray:
+    width_px = int(round(width_mm))
+    height_px = int(round(height_mm))
+    width_px = max(width_px, 1)
+    height_px = max(height_px, 1)
+    return cv2.warpPerspective(frame, homography_mm_from_px, (width_px, height_px))
+
+
+def roi_polygon_mm(tip_mm: np.ndarray, half_size_mm: float) -> np.ndarray:
     offsets = np.array(
         [
-            [-ROI_HALF_SIZE_MM, -ROI_HALF_SIZE_MM],
-            [ROI_HALF_SIZE_MM, -ROI_HALF_SIZE_MM],
-            [ROI_HALF_SIZE_MM, ROI_HALF_SIZE_MM],
-            [-ROI_HALF_SIZE_MM, ROI_HALF_SIZE_MM],
+            [-half_size_mm, -half_size_mm],
+            [half_size_mm, -half_size_mm],
+            [half_size_mm, half_size_mm],
+            [-half_size_mm, half_size_mm],
         ],
         dtype=np.float32,
     )
-    corners_mm = tip_mm + offsets
-    corners_px = project_points(corners_mm, homography_px_from_mm)
-    min_xy = np.clip(np.min(corners_px, axis=0), [0, 0], [FRAME_WIDTH - 1, FRAME_HEIGHT - 1])
-    max_xy = np.clip(np.max(corners_px, axis=0), [0, 0], [FRAME_WIDTH - 1, FRAME_HEIGHT - 1])
-    return min_xy.astype(int), max_xy.astype(int)
+    return tip_mm.reshape(1, 2) + offsets
 
 
-def evaluate_ink_activity(
-    roi_gray: np.ndarray,
-    roi_prev_gray: Optional[np.ndarray],
-    activity_queue: Deque[float],
-) -> float:
-    """Detect new ink by comparing ROI with previous frame and return smoothed activity."""
-
-    if roi_prev_gray is None or roi_prev_gray.shape != roi_gray.shape:
-        activity_queue.append(0.0)
-        return 0.0
-
-    diff = cv2.absdiff(roi_gray, roi_prev_gray)
-    _, diff_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-    activity_value = float(np.sum(diff_mask) / 255.0)
-
-    activity_queue.append(activity_value)
-    smoothed = float(np.mean(activity_queue))
-    return smoothed
+def extract_roi_from_mm_view(
+    mm_gray: np.ndarray,
+    tip_mm: np.ndarray,
+    half_size_mm: float,
+) -> Optional[np.ndarray]:
+    height, width = mm_gray.shape[:2]
+    x_min = max(int(np.floor(tip_mm[0] - half_size_mm)), 0)
+    x_max = min(int(np.ceil(tip_mm[0] + half_size_mm)), width - 1)
+    y_min = max(int(np.floor(tip_mm[1] - half_size_mm)), 0)
+    y_max = min(int(np.ceil(tip_mm[1] + half_size_mm)), height - 1)
+    if x_max <= x_min or y_max <= y_min:
+        return None
+    return mm_gray[y_min : y_max + 1, x_min : x_max + 1]
 
 
-def update_pen_state(
-    activity_value: float,
-    state: TrackingState,
-    pen_down_threshold: float = 80.0,
-    pen_up_threshold: float = 40.0,
-) -> None:
-    """Update pen-down state based on ink activity with hysteresis."""
-
-    if state.pen_down:
-        if activity_value < pen_up_threshold:
-            state.pen_down = False
-    else:
-        if activity_value > pen_down_threshold:
-            state.pen_down = True
-            state.strokes += 1
-
-
-def update_refine_counter(tip_mm: np.ndarray, state: TrackingState) -> None:
-    """Count entries/exits into the refine area while the pen is down."""
-
-    if state.homography_mm_from_px is None:
-        return
-
-    dist = np.linalg.norm(tip_mm - np.array(REFINE_CENTER_MM))
-    inside = dist <= REFINE_RADIUS_MM
-    if state.pen_down:
-        if inside != state.inside_refine:
-            state.refine_count += 1
-    state.inside_refine = inside
+def save_screenshot(frame: np.ndarray, directory: Path = Path("screenshots")) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    filename = directory / f"diagnostic_{timestamp}.png"
+    cv2.imwrite(str(filename), frame)
+    return filename
 
 
 def draw_overlays(
     frame: np.ndarray,
-    state: TrackingState,
-    corner_map: Dict[str, np.ndarray],
-    ring_a: RingDetection,
-    ring_b: RingDetection,
+    lock: MarkerLock,
+    ring_a: Tuple[Optional[np.ndarray], Optional[np.ndarray]],
+    ring_b: Tuple[Optional[np.ndarray], Optional[np.ndarray]],
     tip_px: Optional[np.ndarray],
-    roi_bounds: Optional[Tuple[np.ndarray, np.ndarray]],
+    tip_mm: Optional[np.ndarray],
+    roi_mm: Optional[np.ndarray],
+    stroke_counter: StrokeCounter,
+    config: AppConfig,
 ) -> np.ndarray:
-    """Draw UI overlays on the frame."""
-
     overlay = frame.copy()
 
-    # Draw markers
-    for name, point in corner_map.items():
-        cv2.circle(overlay, tuple(point.astype(int)), 8, (255, 0, 0), 2)
-        cv2.putText(
-            overlay,
-            name,
-            tuple(point.astype(int) + np.array([10, -10])),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 0, 0),
-            2,
-        )
+    if lock.markers:
+        for marker_id, centre in lock.markers.items():
+            cv2.circle(overlay, tuple(np.round(centre).astype(int)), 8, (255, 0, 0), 2)
+            cv2.putText(
+                overlay,
+                f"ID {marker_id}",
+                tuple(np.round(centre + np.array([10, -10])).astype(int)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 0, 0),
+                2,
+            )
 
-    if state.homography_px_from_mm is not None:
+    if lock.locked():
         rect_mm = np.array(
             [
                 [0.0, 0.0],
-                [PARCHMENT_WIDTH_MM, 0.0],
-                [PARCHMENT_WIDTH_MM, PARCHMENT_HEIGHT_MM],
-                [0.0, PARCHMENT_HEIGHT_MM],
+                [config.parchment_width_mm, 0.0],
+                [config.parchment_width_mm, config.parchment_height_mm],
+                [0.0, config.parchment_height_mm],
             ],
             dtype=np.float32,
         )
-        rect_px = project_points(rect_mm, state.homography_px_from_mm).astype(int)
-        cv2.polylines(overlay, [rect_px], True, (0, 255, 255), 2)
+        rect_px = project_points(rect_mm, lock.homography_px_from_mm)
+        cv2.polylines(overlay, [np.round(rect_px).astype(int)], True, (0, 255, 255), 2)
 
-        refine_center_px = mm_to_pixels(np.array(REFINE_CENTER_MM), state.homography_px_from_mm)
-        refine_radius_px = int(
-            np.linalg.norm(
-                mm_to_pixels(np.array([REFINE_CENTER_MM[0] + REFINE_RADIUS_MM, REFINE_CENTER_MM[1]]), state.homography_px_from_mm)
-                - refine_center_px
-            )
-        )
-        cv2.circle(overlay, tuple(refine_center_px.astype(int)), refine_radius_px, (0, 128, 255), 2)
+        if stroke_counter.circle_center_mm is not None:
+            center_px = project_point(stroke_counter.circle_center_mm, lock.homography_px_from_mm)
+            boundary_pt_mm = stroke_counter.circle_center_mm + np.array([config.refine_radius_mm, 0.0])
+            boundary_px = project_point(boundary_pt_mm, lock.homography_px_from_mm)
+            radius_px = int(max(1.0, np.linalg.norm(boundary_px - center_px)))
+            cv2.circle(overlay, tuple(np.round(center_px).astype(int)), radius_px, (0, 165, 255), 1)
 
-    # Draw rings
-    for ring, color in ((ring_a, (0, 255, 255)), (ring_b, (0, 255, 0))):
-        if ring.is_valid():
-            cv2.circle(overlay, tuple(ring.centre_px.astype(int)), 8, color, 2)
-            if ring.contour is not None:
-                cv2.drawContours(overlay, [ring.contour], -1, color, 1)
+        if roi_mm is not None:
+            roi_px = project_points(roi_mm, lock.homography_px_from_mm)
+            cv2.polylines(overlay, [np.round(roi_px).astype(int)], True, (255, 0, 255), 2)
+
+    for centre, contour, colour in (
+        (ring_a[0], ring_a[1], (0, 255, 255)),
+        (ring_b[0], ring_b[1], (0, 255, 0)),
+    ):
+        if centre is not None:
+            cv2.circle(overlay, tuple(np.round(centre).astype(int)), 8, colour, 2)
+        if contour is not None:
+            cv2.drawContours(overlay, [contour], -1, colour, 1)
 
     if tip_px is not None:
-        cv2.circle(overlay, tuple(tip_px.astype(int)), 6, (0, 0, 255), -1)
-
-    if roi_bounds is not None:
-        tl, br = roi_bounds
-        cv2.rectangle(overlay, tuple(tl), tuple(br), (255, 0, 255), 2)
+        cv2.circle(overlay, tuple(np.round(tip_px).astype(int)), 6, (0, 0, 255), -1)
 
     info_lines = [
-        f"Strokes: {state.strokes}",
-        f"Pen down: {'Yes' if state.pen_down else 'No'}",
-        f"Refine count: {state.refine_count}",
-        "Keys: R=Re-lock S=Screenshot ESC=Quit",
+        f"Strokes: {stroke_counter.strokes}",
+        f"Pen down: {'Yes' if stroke_counter.pen_down else 'No'}",
+        f"Refine counter: {stroke_counter.refine}",
+        "Keys: R=re-lock  S=screenshot  ESC=quit",
     ]
     for idx, line in enumerate(info_lines):
         cv2.putText(
@@ -417,109 +517,114 @@ def draw_overlays(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sofrim quill stroke counter")
-    parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help="Camera index")
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path(CONFIG_FILE),
-        help="Path to HSV configuration JSON file",
-    )
+    parser = argparse.ArgumentParser(description="Torah quill stroke counter")
+    parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help="Camera index to use")
+    parser.add_argument("--config", type=Path, default=Path(CONFIG_FILENAME), help="HSV configuration JSON")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    ring_a_threshold = config["ringA"]
-    ring_b_threshold = config["ringB"]
+    config = ensure_config(args.config)
+    HSVCalibrator(CALIBRATION_WINDOW, args.config, config)
 
-    state = TrackingState()
-    cap = create_capture(args.camera)
-    if not cap.isOpened():
-        raise RuntimeError("Unable to access camera")
+    dictionary = cv2.aruco.getPredefinedDictionary(PREFERRED_DICTIONARY)
+    parameters = cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
 
-    prev_gray_roi: Optional[np.ndarray] = None
+    capture = create_capture(args.camera)
+    if not capture.isOpened():
+        raise RuntimeError("Unable to open the webcam. Check camera connection and permissions.")
 
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_TITLE, 1280, 720)
 
-    relock_requested = True
+    lock = MarkerLock()
+    ink_tracker = InkActivityTracker(
+        threshold_on=config.threshold_on,
+        threshold_off=config.threshold_off,
+        window_size=config.smoothing_window,
+    )
+    stroke_counter = StrokeCounter()
+
+    last_screenshot_time = 0.0
+    relock = True
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            success, frame = capture.read()
+            if not success:
+                raise RuntimeError("Camera frame could not be read.")
 
-            frame_display = frame.copy()
-            corner_map: Dict[str, np.ndarray] = {}
+            ring_a = (None, None)
+            ring_b = (None, None)
             tip_px: Optional[np.ndarray] = None
-            roi_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None
             tip_mm: Optional[np.ndarray] = None
+            roi_mm: Optional[np.ndarray] = None
 
-            if relock_requested or state.homography_px_from_mm is None:
-                corners, ids = detect_markers(frame)
-                homographies = compute_homography_from_markers(corners, ids)
-                (state.homography_px_from_mm, state.homography_mm_from_px, corner_map) = homographies
-                relock_requested = False
-                prev_gray_roi = None
+            if relock or not lock.locked():
+                centres = detect_markers(frame, detector)
+                lock.markers = centres
+                homographies = compute_homography(centres, config.parchment_width_mm, config.parchment_height_mm)
+                lock.homography_mm_from_px, lock.homography_px_from_mm = homographies
+                relock = False
+                ink_tracker.clear()
+                stroke_counter.reset()
 
-            if state.homography_mm_from_px is not None:
+            if lock.locked():
                 frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                ring_a = detect_ring(frame_hsv, ring_a_threshold)
-                ring_b = detect_ring(frame_hsv, ring_b_threshold)
-            else:
-                ring_a = RingDetection(None, None)
-                ring_b = RingDetection(None, None)
+                ring_a = detect_ring(frame_hsv, config.ringA)
+                ring_b = detect_ring(frame_hsv, config.ringB)
 
-            if ring_a.is_valid() and ring_b.is_valid() and state.homography_mm_from_px is not None:
-                try:
-                    tip_mm, tip_px, direction = compute_quill_tip(
-                        ring_a.centre_px,
-                        ring_b.centre_px,
-                        state.homography_mm_from_px,
-                        state.homography_px_from_mm,
-                    )
-                except ValueError:
-                    tip_mm = None
-                    tip_px = None
-                else:
-                    roi_tl, roi_br = compute_roi_pixels(tip_mm, state.homography_px_from_mm)
-                    roi_bounds = (roi_tl, roi_br)
-
-                    if roi_br[0] - roi_tl[0] > 2 and roi_br[1] - roi_tl[1] > 2:
-                        roi = frame[roi_tl[1] : roi_br[1], roi_tl[0] : roi_br[0]]
-                        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                        activity_value = evaluate_ink_activity(
-                            roi_gray, prev_gray_roi, state.ink_activity_queue
+                if ring_a[0] is not None and ring_b[0] is not None:
+                    try:
+                        tip_mm, tip_px = compute_tip(
+                            ring_a[0],
+                            ring_b[0],
+                            lock.homography_mm_from_px,
+                            lock.homography_px_from_mm,
+                            config.ring_tip_offset_mm,
                         )
-                        prev_gray_roi = roi_gray.copy()
-                        update_pen_state(activity_value, state)
-                        update_refine_counter(tip_mm, state)
-                    else:
-                        prev_gray_roi = None
-                        state.pen_down = False
+                    except ValueError:
+                        tip_mm = None
+                        tip_px = None
+
+            pen_down = False
+            if tip_mm is not None and lock.locked():
+                mm_view = warp_to_work_area(frame, lock.homography_mm_from_px, config.parchment_width_mm, config.parchment_height_mm)
+                mm_gray = cv2.cvtColor(mm_view, cv2.COLOR_BGR2GRAY)
+                roi_mm_polygon = roi_polygon_mm(tip_mm, config.roi_half_size_mm)
+                roi_mm = roi_mm_polygon
+                roi_gray = extract_roi_from_mm_view(mm_gray, tip_mm, config.roi_half_size_mm)
+                pen_down, _ = ink_tracker.update(roi_gray)
             else:
-                # Reset ROI tracking if we lose the quill
-                prev_gray_roi = None
-                state.pen_down = False
-                state.inside_refine = False
+                ink_tracker.clear()
+                roi_gray = None
 
-            frame_display = draw_overlays(frame_display, state, corner_map, ring_a, ring_b, tip_px, roi_bounds)
-            cv2.imshow(WINDOW_TITLE, frame_display)
+            stroke_counter.update(pen_down, tip_mm, config.refine_radius_mm)
 
+            frame_overlay = draw_overlays(
+                frame,
+                lock,
+                ring_a,
+                ring_b,
+                tip_px,
+                tip_mm,
+                roi_mm,
+                stroke_counter,
+                config,
+            )
+
+            cv2.imshow(WINDOW_TITLE, frame_overlay)
             key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC
+            if key == 27:
                 break
-            elif key in (ord("r"), ord("R")):
-                relock_requested = True
-                state.homography_px_from_mm = None
-                state.homography_mm_from_px = None
+            if key in (ord("r"), ord("R")):
+                relock = True
             elif key in (ord("s"), ord("S")):
-                if time.time() - state.last_screenshot_time > 1.0:
-                    path = save_screenshot(frame_display)
-                    print(f"Saved screenshot to {path}")
-                    state.last_screenshot_time = time.time()
-
+                if time.time() - last_screenshot_time > 1.0:
+                    path = save_screenshot(frame_overlay)
+                    print(f"Saved diagnostic screenshot to {path}")
+                    last_screenshot_time = time.time()
     finally:
-        cap.release()
+        capture.release()
         cv2.destroyAllWindows()
 
 

@@ -1,75 +1,75 @@
-"""Generate a PDF with ArUco markers for sofrim stroke counter calibration."""
+"""Generate a printable PDF containing ArUco markers for the stroke counter setup."""
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
+from typing import Iterable, List
 
 import cv2
+from PIL import Image
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
 
-OUTPUT_PDF = "aruco_markers.pdf"
-MARKER_IDS = list(range(10, 18))
+if not hasattr(cv2, "aruco"):
+    raise ImportError(
+        "cv2.aruco is unavailable. Install the 'opencv-contrib-python' package to generate markers."
+    )
+
+
+OUTPUT_PDF = Path("aruco_markers.pdf")
+MARKER_IDS: List[int] = list(range(10, 18))
 MARKER_SIZE_MM = 10.0
 MARGIN_MM = 15.0
-SPACING_MM = 10.0
+H_SPACING_MM = 12.0
+V_SPACING_MM = 18.0
+COLUMNS = 4
+ROWS = 2
+MM_TO_PT = 2.83465
+MARKER_PIXELS = 600
 
 
-def mm_to_points(mm: float) -> float:
-    """Convert millimetres to PDF points."""
-
-    return mm * 72.0 / 25.4
+def mm_to_points(values: Iterable[float]) -> List[float]:
+    return [float(v) * MM_TO_PT for v in values]
 
 
-def generate_marker_image(dictionary, marker_id: int, pixels: int = 300) -> Path:
-    """Create a temporary PNG image for an ArUco marker."""
+def create_marker_image(dictionary, marker_id: int) -> ImageReader:
+    marker = cv2.aruco.generateImageMarker(dictionary, marker_id, MARKER_PIXELS)
+    marker_rgb = cv2.cvtColor(marker, cv2.COLOR_GRAY2RGB)
+    image = Image.fromarray(marker_rgb)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return ImageReader(buffer)
 
-    marker_image = cv2.aruco.generateImageMarker(dictionary, marker_id, pixels)
-    temp_path = Path(f"aruco_{marker_id}.png")
-    cv2.imwrite(str(temp_path), marker_image)
-    return temp_path
 
-
-def create_pdf(output_path: Path = Path(OUTPUT_PDF)) -> None:
-    """Generate the PDF file containing the markers."""
-
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    c = canvas.Canvas(str(output_path), pagesize=A4)
+def create_pdf(output_path: Path = OUTPUT_PDF) -> None:
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
     page_width, page_height = A4
+    marker_size_pt = MARKER_SIZE_MM * MM_TO_PT
+    margin_x_pt, margin_y_pt = mm_to_points([MARGIN_MM, MARGIN_MM])
+    h_spacing_pt = H_SPACING_MM * MM_TO_PT
+    v_spacing_pt = V_SPACING_MM * MM_TO_PT
 
-    marker_size_pts = mm_to_points(MARKER_SIZE_MM)
-    margin_pts = mm_to_points(MARGIN_MM)
-    spacing_pts = mm_to_points(SPACING_MM)
+    canv = canvas.Canvas(str(output_path), pagesize=A4)
 
-    cols = 4
+    readers = [create_marker_image(dictionary, marker_id) for marker_id in MARKER_IDS]
 
-    x = margin_pts
-    y = page_height - margin_pts - marker_size_pts
+    x = margin_x_pt
+    y = page_height - margin_y_pt - marker_size_pt
+    for idx, (marker_id, reader) in enumerate(zip(MARKER_IDS, readers)):
+        canv.drawImage(reader, x, y, width=marker_size_pt, height=marker_size_pt, preserveAspectRatio=True)
+        canv.setFont("Helvetica", 9)
+        canv.drawCentredString(x + marker_size_pt / 2, y - 8, f"ID {marker_id}")
 
-    temp_files = []
-    try:
-        for idx, marker_id in enumerate(MARKER_IDS):
-            image_path = generate_marker_image(dictionary, marker_id)
-            temp_files.append(image_path)
+        x += marker_size_pt + h_spacing_pt
+        if (idx + 1) % COLUMNS == 0:
+            x = margin_x_pt
+            y -= marker_size_pt + v_spacing_pt
 
-            c.drawImage(
-                str(image_path),
-                x,
-                y,
-                width=marker_size_pts,
-                height=marker_size_pts,
-            )
-            c.drawString(x, y - mm_to_points(3), f"ID {marker_id}")
-
-            x += marker_size_pts + spacing_pts
-            if (idx + 1) % cols == 0:
-                x = margin_pts
-                y -= marker_size_pts + spacing_pts
-        c.save()
-    finally:
-        for temp_path in temp_files:
-            if temp_path.exists():
-                temp_path.unlink()
+    canv.showPage()
+    canv.save()
 
 
 if __name__ == "__main__":
