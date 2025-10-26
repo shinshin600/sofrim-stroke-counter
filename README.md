@@ -1,53 +1,91 @@
 # Sofrim Stroke Counter
 
-This project helps Torah scribes (sofrim) count quill strokes in real time. A Windows PC with a standard 1080p webcam watches the parchment, locks onto four ArUco markers, finds coloured rings on the quill, and measures pen-down activity to tally strokes.
+A single-window Tkinter application that tracks a Torah scribe's quill using
+OpenCV and ArUco markers.  The preferred **Stripe Mode** locks onto a coloured
+stripe glued along the quill and estimates the writing tip using a metric
+homography.  **Rings Mode** is available as a fallback when the stripe is not
+present.
 
-## Windows Setup (Python 3.12)
+## Features
 
-Open **PowerShell** in the project folder and run:
+- One window that displays the live video feed with overlays.
+- Menu bar with actions for starting/stopping capture, taking screenshots,
+  configuring colours, selecting cameras and manual tip alignment.
+- Stripe Mode with RANSAC-assisted axis estimation and exponential smoothing.
+- Rings Mode that tracks two coloured bands near the tip.
+- Ink activity tracking and stroke/refine counters.
+- Built-in PDF generators for stripe patterns and ArUco marker sheets.
+- Configuration saved in `config.json` and optionally overridden with
+  `--mode stripe|rings`.
+
+## Requirements
+
+- Windows 10 or later (the code is cross-platform but tuned for Windows).
+- Python 3.12 (64-bit recommended).
+- A webcam capable of 1080p @ 30fps.
+- The packages listed in `requirements.txt`.
+
+Install dependencies in a virtual environment:
 
 ```powershell
-python -m venv venv
-.\venv\Scripts\activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-python sutam_counter.py
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-The script opens two windows: the main viewer and an HSV calibration panel. If you see an error that `cv2.aruco` is missing, install `opencv-contrib-python` as noted in `requirements.txt`.
+## Running the application
 
-## Printing the Markers
+```powershell
+python sutam_counter.py          # uses mode from config.json
+python sutam_counter.py --mode rings  # override detection mode
+```
 
-1. Generate the PDF:
-   ```powershell
-   python print_aruco.py
-   ```
-2. Print `aruco_markers.pdf` at 100 % scale. Each marker (IDs 10–17) is 10×10 mm. Place IDs 10–13 at the parchment corners, clockwise starting at the top-left. The remaining IDs are spares.
-3. Fix the printed markers to magnets or clips so they stay flat and do not move during writing.
+The application prefers external USB cameras automatically.  You can manually
+choose a camera from **Tools → Select camera…**.
 
-## Preparing the Quill
+## Configuration
 
-- Add a **yellow** ring roughly 10 mm above the quill tip (Ring A).
-- Add a **green** ring roughly 20 mm above the tip (Ring B).
-- Ensure both rings remain in the camera view while writing. Adjust lighting to keep colours vibrant.
+The default `config.json` contains reasonable HSV thresholds for both modes.
+Use **Tools → Color calibration…** to tweak the ranges interactively and save
+back to disk.  Manual tip alignment writes an additional offset in millimetres
+for the active mode.
 
-## Operating the Stroke Counter
+Key parameters:
 
-- The camera is forced to capture at 1920×1080 @ 30 fps. Position the parchment so all four corner markers are visible.
-- Once the homography locks, the software converts between pixels and millimetres. The overlay shows the work-area rectangle, ring detections, the estimated quill tip, and two counters.
-- Pen-down detection uses frame differencing in a tiny region around the tip, with a smoothed signal to suppress noise. The refine counter measures each entry or exit through a 0.8 mm circle while the pen is down.
-- Keyboard controls:
-  - **R** — Re-lock (re-detect the ArUco markers and recompute the homography).
-  - **S** — Save a diagnostic screenshot in the `screenshots/` folder.
-  - **ESC** — Exit the application.
+- `stripe.tip_offset_mm`: distance from the detected far end of the stripe to
+  the actual tip.
+- `rings.tip_distance_mm`: offset from the lower ring to the real tip.
+- `manual_offset_mm`: manual adjustment stored by **Manual tip set…**.
+
+## Printing utilities
+
+Generate helper printouts from the **Print** menu or by running the modules:
+
+```powershell
+python print_stripe.py
+python print_aruco.py
+```
+
+- `stripe_pattern.pdf`: includes a 70 mm stripe with black/white and colour
+  variants and optional tick marks every 5 mm.
+- `aruco_markers.pdf`: includes ArUco IDs 10–17 arranged in two rows of four,
+  each marker 10×10 mm with labels.
+
+Print at 100% scaling on A4 or US Letter paper.  The metric coordinates are
+used to compute the homography that converts pixels to millimetres.
 
 ## Troubleshooting
 
-- **Markers lost or warped:** Improve lighting, keep markers flat, and ensure the webcam is orthogonal to the parchment. Press **R** to re-lock if the parchment shifts.
-- **Rings not detected:** Use the HSV calibration window to adjust the low/high thresholds for each ring. The values are saved back to `config.json` automatically.
-- **No stroke counts:** Confirm the quill tip falls within the ROI overlay. Increase contrast between fresh ink and parchment or adjust room lighting.
-- **`cv2.aruco` import error:** Install `opencv-contrib-python==4.12.0.88` inside the virtual environment.
+- **No camera detected** – ensure the camera is connected and not in use by
+  another application.  The app probes DirectShow, Media Foundation and the
+  default OpenCV backend.
+- **Markers not recognised** – verify that the PDF was printed without scaling
+  and that the markers are well lit.
+- **Stripe not detected** – re-run colour calibration and check that the
+  pattern occupies at least 500 pixels in the image.
+- **Stroke counter erratic** – adjust the lighting and make sure the tip ROI is
+  not obstructed.  Manual tip alignment can also help.
 
 ## License
 
-Provided for ritual-support and educational use; adapt it as needed for your own sofrut workflow.
+MIT License.  See `LICENSE` if provided by the repository owner.
