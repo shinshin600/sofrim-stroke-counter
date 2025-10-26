@@ -63,6 +63,8 @@ MARKER_HORIZONTAL_GAP_MM = 12.0
 MARKER_VERTICAL_GAP_MM = 18.0
 MARKER_COLUMNS = 4
 MARKER_ROWS = 2
+ARUCO_DICTIONARY_ID = cv2.aruco.DICT_4X4_1000
+REQUIRED_LOCK_MARKERS = {10, 11, 12, 13}
 RANSAC_ITERATIONS = 200
 RANSAC_THRESHOLD_PX = 2.5
 EMA_ALPHA = 0.25
@@ -288,8 +290,7 @@ class MarkerHomography:
     """Handles detection of reference markers and conversion between units."""
 
     def __init__(self) -> None:
-        dictionary_id = cv2.aruco.DICT_4X4_1000
-        self.dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+        self.dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICTIONARY_ID)
         try:
             self.parameters = cv2.aruco.DetectorParameters()
         except AttributeError:  # OpenCV < 4.7 fallback
@@ -300,51 +301,81 @@ class MarkerHomography:
             self.detector = None
         self._homography_mm_from_px: Optional[np.ndarray] = None
         self._homography_px_from_mm: Optional[np.ndarray] = None
+        self._locked = False
+        self.last_corners: List[np.ndarray] = []
+        self.last_ids: Optional[np.ndarray] = None
 
     def clear(self) -> None:
         self._homography_mm_from_px = None
         self._homography_px_from_mm = None
+        self._locked = False
+        self.last_corners = []
+        self.last_ids = None
 
-    def update(self, frame: np.ndarray) -> None:
+    def update(self, frame: np.ndarray) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self.detector is not None:
             corners, ids, _ = self.detector.detectMarkers(gray)
         else:
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary, parameters=self.parameters)
-        if ids is None or len(ids) < 4:
-            self.clear()
-            return
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                gray, self.dictionary, parameters=self.parameters
+            )
+        self.last_corners = list(corners) if corners is not None else []
+        self.last_ids = ids
+        if not self._locked:
+            self._attempt_lock(self.last_corners, self.last_ids)
+        return self.last_corners, self.last_ids
+
+    def _attempt_lock(
+        self, corners: Sequence[np.ndarray], ids: Optional[np.ndarray]
+    ) -> bool:
+        if ids is None or len(ids) == 0:
+            return False
+
+        ids_flat = ids.flatten()
+        detected_ids = {int(marker_id) for marker_id in ids_flat}
+        if not REQUIRED_LOCK_MARKERS.issubset(detected_ids):
+            return False
 
         image_pts: List[np.ndarray] = []
         world_pts: List[np.ndarray] = []
 
-        ids = ids.flatten()
-        for idx, marker_id in enumerate(ids):
-            if marker_id not in MARKER_IDS:
+        for idx, marker_id in enumerate(ids_flat):
+            marker_int = int(marker_id)
+            if marker_int not in MARKER_IDS:
                 continue
             c = corners[idx].reshape(-1, 2)
-            for corner in c:
-                image_pts.append(corner)
-            world_pts.extend(self._world_corners(marker_id))
+            image_pts.extend(c)
+            world_pts.extend(self._world_corners(marker_int))
 
         if len(image_pts) < 8:
-            self.clear()
-            return
+            return False
 
         image_pts_np = np.asarray(image_pts, dtype=np.float64)
         world_pts_np = np.asarray(world_pts, dtype=np.float64)
 
         H, mask = cv2.findHomography(image_pts_np, world_pts_np, cv2.RANSAC, 3.0)
-        if H is None or mask is None or mask.sum() < 8:
-            self.clear()
-            return
+        if H is None or mask is None or int(mask.sum()) < 8:
+            return False
 
-        self._homography_mm_from_px = H
         ok, inv = cv2.invert(H)
         if not ok:
-            self.clear()
-            return
+            return False
+
+        self._homography_mm_from_px = H
         self._homography_px_from_mm = inv
+        self._locked = True
+        return True
+
+    def relock(self) -> bool:
+        self._homography_mm_from_px = None
+        self._homography_px_from_mm = None
+        self._locked = False
+        return self._attempt_lock(self.last_corners, self.last_ids)
+
+    @property
+    def is_locked(self) -> bool:
+        return self._locked
 
     def _world_corners(self, marker_id: int) -> List[List[float]]:
         position = MARKER_IDS.index(marker_id)
@@ -667,6 +698,7 @@ class StrokeCounterApp:
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self._on_exit)
+        self.root.bind("<KeyPress>", self._on_key_press)
         self.video_label = ttk.Label(self.root)
         self.video_label.pack(fill=tk.BOTH, expand=True)
         self.status_var = tk.StringVar()
@@ -690,6 +722,18 @@ class StrokeCounterApp:
         self.last_pen_up_time: Optional[float] = None
         self._frame_lock = threading.Lock()
         self._update_timer: Optional[str] = None
+
+    def _on_key_press(self, event: tk.Event) -> None:
+        keysym = event.keysym.lower()
+        if keysym == "r":
+            if self.marker_homography.relock():
+                self.status_var.set("Homography re-locked")
+            else:
+                self.status_var.set("Waiting for ArUco markers…")
+        elif keysym == "s":
+            self._take_screenshot()
+        elif keysym == "escape":
+            self._on_exit()
 
     # ------------------------------ GUI setup ------------------------------
 
@@ -767,7 +811,7 @@ class StrokeCounterApp:
         self.marker_homography.clear()
         self.stripe_mode.reset()
         self.rings_mode.reset()
-        self.status_var.set(f"Camera {index} active")
+        self.status_var.set(f"Camera {index} active - waiting for ArUco markers...")
         self._schedule_update()
 
     def stop(self) -> None:
@@ -800,7 +844,10 @@ class StrokeCounterApp:
     # -------------------------- Frame processing -------------------------
 
     def _process_frame(self, frame: np.ndarray) -> None:
-        self.marker_homography.update(frame)
+        was_locked = self.marker_homography.is_locked
+        corners, ids = self.marker_homography.update(frame)
+        if not was_locked and self.marker_homography.is_locked:
+            self.status_var.set("Work area locked")
         if self.config.mode == "stripe":
             result = self.stripe_mode.process(frame)
             tip_px = result.tip_px
@@ -834,6 +881,8 @@ class StrokeCounterApp:
             self.last_tip_mm = result.tip_mm.copy()
 
         overlay = frame.copy()
+        if corners and ids is not None:
+            cv2.aruco.drawDetectedMarkers(overlay, corners, ids)
         if isinstance(result, StripeDetectionResult) and result.contour is not None:
             cv2.drawContours(overlay, [result.contour], -1, (0, 255, 0), 2)
         if isinstance(result, StripeDetectionResult) and result.bounding_box is not None:
@@ -853,6 +902,17 @@ class StrokeCounterApp:
         cv2.putText(overlay, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         if pen_down:
             cv2.putText(overlay, "PEN DOWN", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        helper_text = "Keys: R=re-lock S=screenshot ESC=quit"
+        cv2.putText(
+            overlay,
+            helper_text,
+            (20, overlay.shape[0] - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (180, 255, 180),
+            2,
+        )
 
         rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
