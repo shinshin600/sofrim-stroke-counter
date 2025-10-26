@@ -28,7 +28,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -1084,6 +1084,7 @@ class StrokeCounterApp:
         self.last_pen_up_time: Optional[float] = None
         self._frame_lock = threading.Lock()
         self._update_timer: Optional[str] = None
+        self._color_dialog_geometry: Optional[str] = None
 
     def _on_key_press(self, event: tk.Event) -> None:
         keysym = event.keysym.lower()
@@ -1321,19 +1322,98 @@ class StrokeCounterApp:
         self.status_var.set(f"Saved screenshot to {filename}")
 
     def _color_calibration(self) -> None:
+        class ScrollableFrame(ttk.Frame):
+            def __init__(self, parent: tk.Widget):
+                super().__init__(parent)
+                self.canvas = tk.Canvas(self, highlightthickness=0)
+                self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+                self.inner = ttk.Frame(self.canvas)
+                self._inner_window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+                self.canvas.configure(yscrollcommand=self.vsb.set)
+                self.canvas.grid(row=0, column=0, sticky="nsew")
+                self.vsb.grid(row=0, column=1, sticky="ns")
+                self.grid_rowconfigure(0, weight=1)
+                self.grid_columnconfigure(0, weight=1)
+
+                self.inner.bind(
+                    "<Configure>",
+                    lambda _: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+                )
+                self.canvas.bind(
+                    "<Configure>",
+                    lambda event: self.canvas.itemconfigure(self._inner_window, width=event.width),
+                )
+
+                def _on_wheel(event: tk.Event) -> None:
+                    if getattr(event, "delta", 0):
+                        delta = -1 * int(event.delta / 120) if abs(event.delta) >= 1 else 0
+                        if delta == 0:
+                            delta = -1 if event.delta > 0 else 1
+                    else:
+                        delta = 1 if getattr(event, "num", 0) == 5 else -1
+                    self.canvas.yview_scroll(delta, "units")
+
+                self._bindings = []
+                for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    self.canvas.bind_all(sequence, _on_wheel, add=True)
+                    self._bindings.append(sequence)
+
+            def cleanup(self) -> None:
+                for sequence in self._bindings:
+                    self.canvas.unbind_all(sequence)
+
+            def destroy(self) -> None:  # type: ignore[override]
+                self.cleanup()
+                super().destroy()
+
         dialog = tk.Toplevel(self.root)
         dialog.title("Colour calibration")
+        dialog.transient(self.root)
         dialog.grab_set()
-        dialog.columnconfigure(0, weight=1)
+        dialog.resizable(True, True)
+
+        screen_height = dialog.winfo_screenheight()
+        screen_width = dialog.winfo_screenwidth()
+        max_height = int(screen_height * 0.8)
+        max_width = min(760, int(screen_width * 0.9))
+        dialog.geometry(f"{max_width}x{max_height}")
+        if self._color_dialog_geometry:
+            dialog.geometry(self._color_dialog_geometry)
+
+        content = ScrollableFrame(dialog)
+        content.grid(row=0, column=0, sticky="nsew")
+        button_bar = ttk.Frame(dialog)
+        button_bar.grid(row=1, column=0, sticky="ew")
+        dialog.grid_rowconfigure(0, weight=1)
+        dialog.grid_columnconfigure(0, weight=1)
 
         labels = ["H", "S", "V"]
+        scale_length = 240 if screen_width < 1366 else 300
+        columns = 2 if screen_width >= 1366 else 1
+        for col in range(columns):
+            content.inner.grid_columnconfigure(col, weight=1)
 
-        def create_scale_group(parent: tk.Widget, title: str, low: Sequence[int], high: Sequence[int]):
+        next_row = 0
+        next_col = 0
+
+        def place_group(frame: ttk.LabelFrame) -> None:
+            nonlocal next_row, next_col
+            frame.grid(row=next_row, column=next_col, sticky="nsew", padx=10, pady=6)
+            next_col += 1
+            if next_col >= columns:
+                next_col = 0
+                next_row += 1
+
+        def create_scale_group(
+            parent: ttk.Frame,
+            title: str,
+            low: Sequence[int],
+            high: Sequence[int],
+        ) -> Tuple[List[tk.Scale], List[tk.Scale]]:
             frame = ttk.LabelFrame(parent, text=title)
             frame.grid_columnconfigure(0, weight=1)
-            frame.pack(fill=tk.X, padx=10, pady=5)
-            low_scales = []
-            high_scales = []
+            low_scales: List[tk.Scale] = []
+            high_scales: List[tk.Scale] = []
             for idx, label in enumerate(labels):
                 scale = tk.Scale(
                     frame,
@@ -1341,7 +1421,7 @@ class StrokeCounterApp:
                     to=255,
                     orient=tk.HORIZONTAL,
                     label=f"Low {label}",
-                    length=280,
+                    length=scale_length,
                 )
                 scale.set(int(low[idx]))
                 scale.grid(row=idx, column=0, padx=6, pady=3, sticky="ew")
@@ -1353,67 +1433,80 @@ class StrokeCounterApp:
                     to=255,
                     orient=tk.HORIZONTAL,
                     label=f"High {label}",
-                    length=280,
+                    length=scale_length,
                 )
                 scale.set(int(high[idx]))
                 scale.grid(row=idx + 3, column=0, padx=6, pady=3, sticky="ew")
                 high_scales.append(scale)
+            place_group(frame)
             return low_scales, high_scales
+
+        def close_dialog() -> None:
+            self._color_dialog_geometry = dialog.winfo_geometry()
+            content.cleanup()
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        def cancel() -> None:
+            close_dialog()
+
+        save_handler: Optional[Callable[[], None]] = None
 
         mode = self.config.mode
         if mode == "stripe":
             low_scales, high_scales = create_scale_group(
-                dialog,
+                content.inner,
                 "Stripe HSV range",
                 self.config.stripe.hsv_low,
                 self.config.stripe.hsv_high,
             )
 
-            def save() -> None:
+            def save_handler() -> None:
                 new_low = [scale.get() for scale in low_scales]
                 new_high = [scale.get() for scale in high_scales]
                 self.config.stripe.hsv_low = tuple(new_low)
                 self.config.stripe.hsv_high = tuple(new_high)
                 self.config.dump(CONFIG_FILE)
-                dialog.destroy()
 
         elif mode == "rings":
             ringA_low_scales, ringA_high_scales = create_scale_group(
-                dialog,
+                content.inner,
                 "Ring A HSV range",
                 self.config.rings.ringA_low,
                 self.config.rings.ringA_high,
             )
             ringB_low_scales, ringB_high_scales = create_scale_group(
-                dialog,
+                content.inner,
                 "Ring B HSV range",
                 self.config.rings.ringB_low,
                 self.config.rings.ringB_high,
             )
 
-            def save() -> None:
+            def save_handler() -> None:
                 self.config.rings.ringA_low = tuple(scale.get() for scale in ringA_low_scales)
                 self.config.rings.ringA_high = tuple(scale.get() for scale in ringA_high_scales)
                 self.config.rings.ringB_low = tuple(scale.get() for scale in ringB_low_scales)
                 self.config.rings.ringB_high = tuple(scale.get() for scale in ringB_high_scales)
                 self.config.dump(CONFIG_FILE)
-                dialog.destroy()
 
         else:
             cyan_low_scales, cyan_high_scales = create_scale_group(
-                dialog,
+                content.inner,
                 "Cyan band HSV range",
                 self.config.color_dual_rings.cyan_low,
                 self.config.color_dual_rings.cyan_high,
             )
             magenta_low_scales, magenta_high_scales = create_scale_group(
-                dialog,
+                content.inner,
                 "Magenta band HSV range",
                 self.config.color_dual_rings.magenta_low,
                 self.config.color_dual_rings.magenta_high,
             )
 
-            def save() -> None:
+            def save_handler() -> None:
                 self.config.color_dual_rings.cyan_low = tuple(
                     scale.get() for scale in cyan_low_scales
                 )
@@ -1427,9 +1520,33 @@ class StrokeCounterApp:
                     scale.get() for scale in magenta_high_scales
                 )
                 self.config.dump(CONFIG_FILE)
-                dialog.destroy()
 
-        ttk.Button(dialog, text="Save", command=save).pack(pady=10)
+        def on_save() -> None:
+            if save_handler is not None:
+                save_handler()
+            close_dialog()
+
+        def bind_scroll(sequence: str, amount: int, units: str = "units") -> None:
+            def handler(event: tk.Event) -> Optional[str]:
+                if isinstance(event.widget, tk.Scale):
+                    return None
+                content.canvas.yview_scroll(amount, units)
+                return "break"
+
+            dialog.bind(sequence, handler)
+
+        bind_scroll("<Down>", 1)
+        bind_scroll("<Up>", -1)
+        bind_scroll("<Next>", 1, "pages")
+        bind_scroll("<Prior>", -1, "pages")
+
+        dialog.bind("<Escape>", lambda event: (cancel(), "break"))
+        dialog.bind("<Control-s>", lambda event: (on_save(), "break"))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+        button_bar.columnconfigure(0, weight=1)
+        ttk.Button(button_bar, text="Save", command=on_save).pack(side="right", padx=8, pady=8)
+        ttk.Button(button_bar, text="Cancel", command=cancel).pack(side="right", padx=4, pady=8)
 
     def _select_camera(self) -> None:
         dialog = tk.Toplevel(self.root)
