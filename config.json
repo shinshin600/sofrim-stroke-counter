@@ -1,4 +1,24 @@
 {
-  "ringA": {"low": [20, 80, 80], "high": [35, 255, 255]},
-  "ringB": {"low": [40, 60, 60], "high": [80, 255, 255]}
+  "mode": "stripe",
+  "stripe": {
+    "palette": "green-white",
+    "hsv_low": [55, 100, 100],
+    "hsv_high": [78, 255, 255],
+    "use_ticks": true,
+    "tick_mm": 5.0,
+    "min_area_px": 500,
+    "tip_reference": "far_end",
+    "tip_offset_mm": 5.0,
+    "manual_offset_mm": [0.0, 0.0]
+  },
+  "rings": {
+    "ringA": {"low": [20, 90, 130], "high": [38, 255, 255]},
+    "ringB": {"low": [58, 90, 100], "high": [78, 255, 255]},
+    "tip_distance_mm": 14.0,
+    "manual_offset_mm": [0.0, 0.0]
+  },
+  "ui": {
+    "language": "en",
+    "single_window": true
+  }
 }
