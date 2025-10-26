@@ -486,30 +486,33 @@ class StripeMode:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
+        bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, bridge_kernel)
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             self.reset()
             return result
 
-        contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(contour) < self.config.min_area_px:
+        kept_contours = [c for c in contours if cv2.contourArea(c) >= self.config.min_area_px]
+        if not kept_contours:
             self.reset()
             return result
 
-        contour_pts = contour.reshape(-1, 2).astype(np.float32)
+        pts = np.vstack([c.reshape(-1, 2) for c in kept_contours]).astype(np.float32)
+
         try:
-            point_on_line, direction = ransac_line(contour_pts)
+            point_on_line, direction = ransac_line(pts)
         except ValueError:
             self.reset()
             return result
 
-        rect = cv2.minAreaRect(contour)
+        rect = cv2.minAreaRect(pts)
         box = cv2.boxPoints(rect).astype(np.int32)
 
         # Determine far end of stripe
-        projections = contour_pts @ direction
-        far_idx = int(np.argmax(projections))
-        far_end = contour_pts[far_idx]
+        projections = pts @ direction
+        far_end = pts[int(np.argmax(projections))]
 
         # Determine axis direction in millimetres
         if not self.homography.ready:
@@ -537,7 +540,7 @@ class StripeMode:
         result.tip_px = tip_px
         result.tip_mm = tip_mm
         result.far_end_px = far_end
-        result.contour = contour
+        result.contour = max(kept_contours, key=cv2.contourArea)
         result.bounding_box = box
         result.roi = roi
         self.last_result = result
