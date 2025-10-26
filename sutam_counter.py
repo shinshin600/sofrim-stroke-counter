@@ -40,7 +40,7 @@ try:
 except Exception as exc:  # pragma: no cover - Tkinter should always be present
     raise RuntimeError("Tkinter is required to run the GUI") from exc
 
-from print_aruco import create_pdf as create_aruco_pdf
+from print_aruco import create_pdf as create_aruco_pdf, create_rails_pdf
 from print_stripe import create_pdf as create_stripe_pdf
 
 
@@ -57,14 +57,7 @@ DEFAULT_FRAME_SIZE = (1920, 1080)
 DEFAULT_FPS = 30
 CAMERA_PROBE_ORDER = [1, 2, 0, 3, 4]
 CAMERA_BACKENDS = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
-MARKER_IDS = list(range(10, 18))
-MARKER_SIZE_MM = 10.0
-MARKER_HORIZONTAL_GAP_MM = 12.0
-MARKER_VERTICAL_GAP_MM = 18.0
-MARKER_COLUMNS = 4
-MARKER_ROWS = 2
 ARUCO_DICTIONARY_ID = cv2.aruco.DICT_4X4_1000
-REQUIRED_LOCK_MARKERS = {10, 11, 12, 13}
 RANSAC_ITERATIONS = 200
 RANSAC_THRESHOLD_PX = 2.5
 EMA_ALPHA = 0.25
@@ -167,6 +160,86 @@ class RingsConfig:
 
 
 @dataclass
+class ColorDualRingsConfig:
+    cyan_low: Tuple[int, int, int] = (85, 120, 120)
+    cyan_high: Tuple[int, int, int] = (100, 255, 255)
+    magenta_low: Tuple[int, int, int] = (160, 120, 120)
+    magenta_high: Tuple[int, int, int] = (179, 255, 255)
+    front_to_tip_mm: float = 12.0
+    min_area_px: int = 150
+    ema_alpha: float = 0.25
+    max_jump_mm: float = 3.0
+    lost_reacq_frames: int = 12
+    roi_pad_mm: float = 8.0
+    angle_gate_deg: float = 25.0
+    manual_offset_mm: Tuple[float, float] = (0.0, 0.0)
+
+    @staticmethod
+    def from_mapping(data: Dict[str, object]) -> "ColorDualRingsConfig":
+        return ColorDualRingsConfig(
+            cyan_low=tuple(int(v) for v in data.get("cyan_low", (85, 120, 120))),
+            cyan_high=tuple(int(v) for v in data.get("cyan_high", (100, 255, 255))),
+            magenta_low=tuple(int(v) for v in data.get("magenta_low", (160, 120, 120))),
+            magenta_high=tuple(int(v) for v in data.get("magenta_high", (179, 255, 255))),
+            front_to_tip_mm=float(data.get("front_to_tip_mm", 12.0)),
+            min_area_px=int(data.get("min_area_px", 150)),
+            ema_alpha=float(data.get("ema_alpha", 0.25)),
+            max_jump_mm=float(data.get("max_jump_mm", 3.0)),
+            lost_reacq_frames=int(data.get("lost_reacq_frames", 12)),
+            roi_pad_mm=float(data.get("roi_pad_mm", 8.0)),
+            angle_gate_deg=float(data.get("angle_gate_deg", 25.0)),
+            manual_offset_mm=_as_tuple(data.get("manual_offset_mm", (0.0, 0.0))),
+        )
+
+    def to_mapping(self) -> Dict[str, object]:
+        return {
+            "cyan_low": list(self.cyan_low),
+            "cyan_high": list(self.cyan_high),
+            "magenta_low": list(self.magenta_low),
+            "magenta_high": list(self.magenta_high),
+            "front_to_tip_mm": self.front_to_tip_mm,
+            "min_area_px": self.min_area_px,
+            "ema_alpha": self.ema_alpha,
+            "max_jump_mm": self.max_jump_mm,
+            "lost_reacq_frames": self.lost_reacq_frames,
+            "roi_pad_mm": self.roi_pad_mm,
+            "angle_gate_deg": self.angle_gate_deg,
+            "manual_offset_mm": list(self.manual_offset_mm),
+        }
+
+
+@dataclass
+class RailsConfig:
+    aruco_dictionary: str = "DICT_4X4_1000"
+    marker_size_mm: float = 15.0
+    gap_h_mm: float = 12.0
+    gap_v_mm: float = 18.0
+    top_ids: Tuple[int, ...] = (10, 11, 12, 13)
+    side_ids: Tuple[int, ...] = (14, 15, 16, 17)
+
+    @staticmethod
+    def from_mapping(data: Dict[str, object]) -> "RailsConfig":
+        return RailsConfig(
+            aruco_dictionary=str(data.get("aruco_dictionary", "DICT_4X4_1000")),
+            marker_size_mm=float(data.get("marker_size_mm", 15.0)),
+            gap_h_mm=float(data.get("gap_h_mm", 12.0)),
+            gap_v_mm=float(data.get("gap_v_mm", 18.0)),
+            top_ids=tuple(int(v) for v in data.get("top_ids", (10, 11, 12, 13))),
+            side_ids=tuple(int(v) for v in data.get("side_ids", (14, 15, 16, 17))),
+        )
+
+    def to_mapping(self) -> Dict[str, object]:
+        return {
+            "aruco_dictionary": self.aruco_dictionary,
+            "marker_size_mm": self.marker_size_mm,
+            "gap_h_mm": self.gap_h_mm,
+            "gap_v_mm": self.gap_v_mm,
+            "top_ids": list(self.top_ids),
+            "side_ids": list(self.side_ids),
+        }
+
+
+@dataclass
 class UIConfig:
     language: str = "en"
     single_window: bool = True
@@ -187,6 +260,8 @@ class AppConfig:
     mode: str = "stripe"
     stripe: StripeConfig = field(default_factory=StripeConfig)
     rings: RingsConfig = field(default_factory=RingsConfig)
+    color_dual_rings: ColorDualRingsConfig = field(default_factory=ColorDualRingsConfig)
+    rails: RailsConfig = field(default_factory=RailsConfig)
     ui: UIConfig = field(default_factory=UIConfig)
 
     @staticmethod
@@ -199,6 +274,8 @@ class AppConfig:
             mode=str(data.get("mode", "stripe")),
             stripe=StripeConfig.from_mapping(data.get("stripe", {})),
             rings=RingsConfig.from_mapping(data.get("rings", {})),
+            color_dual_rings=ColorDualRingsConfig.from_mapping(data.get("color_dual_rings", {})),
+            rails=RailsConfig.from_mapping(data.get("rails", {})),
             ui=UIConfig.from_mapping(data.get("ui", {})),
         )
 
@@ -207,6 +284,8 @@ class AppConfig:
             "mode": self.mode,
             "stripe": self.stripe.to_mapping(),
             "rings": self.rings.to_mapping(),
+            "color_dual_rings": self.color_dual_rings.to_mapping(),
+            "rails": self.rails.to_mapping(),
             "ui": self.ui.to_mapping(),
         }
         with path.open("w", encoding="utf-8") as handle:
@@ -312,11 +391,20 @@ class InkActivityTracker:
 # ---------------------------------------------------------------------------
 
 
+def _aruco_dict_from_name(name: str) -> int:
+    attr = name.strip().upper()
+    if hasattr(cv2.aruco, attr):
+        return getattr(cv2.aruco, attr)
+    return ARUCO_DICTIONARY_ID
+
+
 class MarkerHomography:
     """Handles detection of reference markers and conversion between units."""
 
-    def __init__(self) -> None:
-        self.dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICTIONARY_ID)
+    def __init__(self, rails_config: RailsConfig) -> None:
+        self.rails_config = rails_config
+        dict_id = _aruco_dict_from_name(self.rails_config.aruco_dictionary)
+        self.dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
         try:
             self.parameters = cv2.aruco.DetectorParameters()
         except AttributeError:  # OpenCV < 4.7 fallback
@@ -330,6 +418,8 @@ class MarkerHomography:
         self._locked = False
         self.last_corners: List[np.ndarray] = []
         self.last_ids: Optional[np.ndarray] = None
+        self._world_lookup = self._build_world_lookup()
+        self.marker_ids = list(self._world_lookup.keys())
 
     def clear(self) -> None:
         self._homography_mm_from_px = None
@@ -359,20 +449,18 @@ class MarkerHomography:
             return False
 
         ids_flat = ids.flatten()
-        detected_ids = {int(marker_id) for marker_id in ids_flat}
-        if not REQUIRED_LOCK_MARKERS.issubset(detected_ids):
+        valid_indices = [idx for idx, marker_id in enumerate(ids_flat) if int(marker_id) in self.marker_ids]
+        if len(valid_indices) < 4:
             return False
 
         image_pts: List[np.ndarray] = []
         world_pts: List[np.ndarray] = []
 
-        for idx, marker_id in enumerate(ids_flat):
-            marker_int = int(marker_id)
-            if marker_int not in MARKER_IDS:
-                continue
+        for idx in valid_indices:
+            marker_int = int(ids_flat[idx])
             c = corners[idx].reshape(-1, 2)
             image_pts.extend(c)
-            world_pts.extend(self._world_corners(marker_int))
+            world_pts.extend(self._world_lookup[marker_int])
 
         if len(image_pts) < 8:
             return False
@@ -403,20 +491,35 @@ class MarkerHomography:
     def is_locked(self) -> bool:
         return self._locked
 
-    def _world_corners(self, marker_id: int) -> List[List[float]]:
-        position = MARKER_IDS.index(marker_id)
-        row = position // MARKER_COLUMNS
-        col = position % MARKER_COLUMNS
-        step_x = MARKER_SIZE_MM + MARKER_HORIZONTAL_GAP_MM
-        step_y = MARKER_SIZE_MM + MARKER_VERTICAL_GAP_MM
-        origin_x = col * step_x
-        origin_y = row * step_y
-        return [
-            [origin_x, origin_y],
-            [origin_x + MARKER_SIZE_MM, origin_y],
-            [origin_x + MARKER_SIZE_MM, origin_y + MARKER_SIZE_MM],
-            [origin_x, origin_y + MARKER_SIZE_MM],
-        ]
+    def _build_world_lookup(self) -> Dict[int, List[List[float]]]:
+        lookup: Dict[int, List[List[float]]] = {}
+        marker_size = float(self.rails_config.marker_size_mm)
+        step_x = marker_size + float(self.rails_config.gap_h_mm)
+        step_y = marker_size + float(self.rails_config.gap_v_mm)
+        margin = float(self.rails_config.gap_h_mm)
+
+        for idx, marker_id in enumerate(self.rails_config.top_ids):
+            origin_x = idx * step_x
+            origin_y = 0.0
+            lookup[int(marker_id)] = [
+                [origin_x, origin_y],
+                [origin_x + marker_size, origin_y],
+                [origin_x + marker_size, origin_y + marker_size],
+                [origin_x, origin_y + marker_size],
+            ]
+
+        column_x = len(self.rails_config.top_ids) * step_x + margin
+        for idx, marker_id in enumerate(self.rails_config.side_ids):
+            origin_x = column_x
+            origin_y = (idx + 1) * step_y
+            lookup[int(marker_id)] = [
+                [origin_x, origin_y],
+                [origin_x + marker_size, origin_y],
+                [origin_x + marker_size, origin_y + marker_size],
+                [origin_x, origin_y + marker_size],
+            ]
+
+        return lookup
 
     @property
     def ready(self) -> bool:
@@ -784,6 +887,164 @@ class RingsMode:
 
 
 # ---------------------------------------------------------------------------
+# Colour dual-rings mode implementation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ColorDualRingsDetectionResult:
+    tip_px: Optional[np.ndarray] = None
+    tip_mm: Optional[np.ndarray] = None
+    cyan_center_px: Optional[np.ndarray] = None
+    magenta_center_px: Optional[np.ndarray] = None
+    roi: Optional[Tuple[int, int, int, int]] = None
+
+
+class ColorDualRingsMode:
+    def __init__(self, config: ColorDualRingsConfig, homography: MarkerHomography) -> None:
+        self.config = config
+        self.homography = homography
+        self.tip_filter = ExponentialMovingAverage(alpha=self.config.ema_alpha)
+        self.prev_tip_mm: Optional[np.ndarray] = None
+        self.prev_line_dir_mm: Optional[np.ndarray] = None
+        self.lost_counter = 0
+        self.last_result: ColorDualRingsDetectionResult = ColorDualRingsDetectionResult()
+
+    def reset(self) -> None:
+        self.tip_filter.alpha = float(self.config.ema_alpha)
+        self.tip_filter.reset()
+        self.prev_tip_mm = None
+        self.prev_line_dir_mm = None
+        self.lost_counter = 0
+        self.last_result = ColorDualRingsDetectionResult()
+
+    def process(self, frame: np.ndarray) -> ColorDualRingsDetectionResult:
+        result = ColorDualRingsDetectionResult()
+        if not self.homography.ready:
+            self.reset()
+            return result
+
+        roi = self._search_roi(frame.shape)
+        rx, ry, rw, rh = roi
+        frame_roi = frame[ry : ry + rh, rx : rx + rw]
+
+        hsv = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2HSV)
+        cyan_mask = cv2.inRange(hsv, np.array(self.config.cyan_low), np.array(self.config.cyan_high))
+        magenta_mask = cv2.inRange(hsv, np.array(self.config.magenta_low), np.array(self.config.magenta_high))
+
+        kernel = np.ones((3, 3), np.uint8)
+        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_OPEN, kernel)
+        magenta_mask = cv2.morphologyEx(magenta_mask, cv2.MORPH_OPEN, kernel)
+        cyan_mask = cv2.dilate(cyan_mask, kernel, iterations=1)
+        magenta_mask = cv2.dilate(magenta_mask, kernel, iterations=1)
+
+        cyan_center_roi, cyan_area = self._largest_centroid_and_area(cyan_mask)
+        magenta_center_roi, magenta_area = self._largest_centroid_and_area(magenta_mask)
+
+        if (
+            cyan_center_roi is None
+            or magenta_center_roi is None
+            or cyan_area < self.config.min_area_px
+            or magenta_area < self.config.min_area_px
+        ):
+            self.lost_counter += 1
+            return self._hold_last(result, roi)
+
+        cyan_center_px = cyan_center_roi + np.array([rx, ry], dtype=float)
+        magenta_center_px = magenta_center_roi + np.array([rx, ry], dtype=float)
+
+        cyan_center_mm = self.homography.project_px_to_mm(cyan_center_px.reshape(1, 2))[0]
+        magenta_center_mm = self.homography.project_px_to_mm(magenta_center_px.reshape(1, 2))[0]
+
+        axis_mm = normalise(cyan_center_mm - magenta_center_mm)
+        if np.allclose(axis_mm, 0):
+            self.lost_counter += 1
+            return self._hold_last(result, roi)
+
+        if not angle_consistent(axis_mm, self.prev_line_dir_mm, self.config.angle_gate_deg):
+            self.lost_counter += 1
+            return self._hold_last(result, roi)
+
+        tip_mm_new = (
+            cyan_center_mm
+            - axis_mm * float(self.config.front_to_tip_mm)
+            + np.asarray(self.config.manual_offset_mm, dtype=float)
+        )
+
+        if self.prev_tip_mm is not None:
+            if float(np.linalg.norm(tip_mm_new - self.prev_tip_mm)) > float(self.config.max_jump_mm):
+                self.lost_counter += 1
+                return self._hold_last(result, roi)
+
+        tip_mm_smooth = self.tip_filter.update(tip_mm_new)
+        tip_px = self.homography.project_mm_to_px(tip_mm_smooth.reshape(1, 2))[0]
+
+        self.prev_tip_mm = tip_mm_smooth.copy()
+        self.prev_line_dir_mm = axis_mm.copy()
+        self.lost_counter = 0
+
+        result.tip_px = tip_px
+        result.tip_mm = tip_mm_smooth
+        result.cyan_center_px = cyan_center_px
+        result.magenta_center_px = magenta_center_px
+        result.roi = roi
+        self.last_result = result
+        return result
+
+    def _largest_centroid_and_area(
+        self, mask: np.ndarray
+    ) -> Tuple[Optional[np.ndarray], float]:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, 0.0
+        contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(contour))
+        if area <= 0:
+            return None, 0.0
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            return None, area
+        cx = float(M["m10"] / M["m00"])
+        cy = float(M["m01"] / M["m00"])
+        return np.array([cx, cy], dtype=float), area
+
+    def _search_roi(self, frame_shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
+        if (
+            self.prev_tip_mm is None
+            or self.lost_counter >= int(self.config.lost_reacq_frames)
+            or not self.homography.ready
+        ):
+            height, width = frame_shape[0], frame_shape[1]
+            return (0, 0, width, height)
+
+        anchor = self.prev_tip_mm
+        anchor_px = self.homography.project_mm_to_px(anchor.reshape(1, 2))[0]
+        mm_anchor = anchor + np.array([10.0, 0.0])
+        mm_anchor_px = self.homography.project_mm_to_px(mm_anchor.reshape(1, 2))[0]
+        mm_to_px = max(1.0, float(np.linalg.norm(mm_anchor_px - anchor_px) / 10.0))
+        pad_px = int(max(16, self.config.roi_pad_mm * mm_to_px))
+
+        cx = int(anchor_px[0])
+        cy = int(anchor_px[1])
+        x1 = max(0, cx - pad_px)
+        y1 = max(0, cy - pad_px)
+        x2 = min(frame_shape[1], cx + pad_px)
+        y2 = min(frame_shape[0], cy + pad_px)
+        return (x1, y1, x2 - x1, y2 - y1)
+
+    def _hold_last(
+        self, result: ColorDualRingsDetectionResult, roi: Tuple[int, int, int, int]
+    ) -> ColorDualRingsDetectionResult:
+        result.roi = roi
+        if self.prev_tip_mm is not None and self.homography.ready:
+            tip_px = self.homography.project_mm_to_px(self.prev_tip_mm.reshape(1, 2))[0]
+            result.tip_px = tip_px
+            result.tip_mm = self.prev_tip_mm.copy()
+        self.last_result = result
+        return result
+
+
+# ---------------------------------------------------------------------------
 # GUI controller
 # ---------------------------------------------------------------------------
 
@@ -808,9 +1069,12 @@ class StrokeCounterApp:
         self.current_frame: Optional[np.ndarray] = None
         self.running = False
         self.photo_image: Optional[ImageTk.PhotoImage] = None
-        self.marker_homography = MarkerHomography()
+        self.marker_homography = MarkerHomography(self.config.rails)
         self.stripe_mode = StripeMode(self.config.stripe, self.marker_homography)
         self.rings_mode = RingsMode(self.config.rings, self.marker_homography)
+        self.color_dual_mode = ColorDualRingsMode(
+            self.config.color_dual_rings, self.marker_homography
+        )
         self.ink_tracker = InkActivityTracker()
         self.stroke_count = 0
         self.refine_count = 0
@@ -856,6 +1120,7 @@ class StrokeCounterApp:
         print_menu = tk.Menu(menu_bar, tearoff=False)
         print_menu.add_command(label="Print stripe pattern…", command=self._print_stripe)
         print_menu.add_command(label="Print ArUco markers…", command=self._print_aruco)
+        print_menu.add_command(label="Print rails…", command=self._print_rails)
         menu_bar.add_cascade(label="Print", menu=print_menu)
 
         help_menu = tk.Menu(menu_bar, tearoff=False)
@@ -909,6 +1174,7 @@ class StrokeCounterApp:
         self.marker_homography.clear()
         self.stripe_mode.reset()
         self.rings_mode.reset()
+        self.color_dual_mode.reset()
         self.status_var.set(f"Camera {index} active - waiting for ArUco markers...")
         self._schedule_update()
 
@@ -946,11 +1212,15 @@ class StrokeCounterApp:
         corners, ids = self.marker_homography.update(frame)
         if not was_locked and self.marker_homography.is_locked:
             self.status_var.set("Work area locked")
-        if self.config.mode == "stripe":
+        mode = self.config.mode
+        if mode == "stripe":
             result = self.stripe_mode.process(frame)
             tip_px = result.tip_px
-        else:
+        elif mode == "rings":
             result = self.rings_mode.process(frame)
+            tip_px = result.tip_px
+        else:
+            result = self.color_dual_mode.process(frame)
             tip_px = result.tip_px
 
         roi_gray = None
@@ -990,6 +1260,23 @@ class StrokeCounterApp:
                 cv2.circle(overlay, tuple(int(v) for v in result.ringA_center), 8, (0, 255, 255), 2)
             if result.ringB_center is not None:
                 cv2.circle(overlay, tuple(int(v) for v in result.ringB_center), 8, (255, 255, 0), 2)
+        if isinstance(result, ColorDualRingsDetectionResult):
+            if result.cyan_center_px is not None:
+                cv2.circle(
+                    overlay,
+                    tuple(int(v) for v in result.cyan_center_px),
+                    8,
+                    (255, 255, 0),
+                    2,
+                )
+            if result.magenta_center_px is not None:
+                cv2.circle(
+                    overlay,
+                    tuple(int(v) for v in result.magenta_center_px),
+                    8,
+                    (255, 0, 255),
+                    2,
+                )
         if tip_px is not None:
             cv2.circle(overlay, tuple(int(v) for v in tip_px), 6, (0, 0, 255), -1)
         if result.roi is not None:
@@ -1073,7 +1360,8 @@ class StrokeCounterApp:
                 high_scales.append(scale)
             return low_scales, high_scales
 
-        if self.config.mode == "stripe":
+        mode = self.config.mode
+        if mode == "stripe":
             low_scales, high_scales = create_scale_group(
                 dialog,
                 "Stripe HSV range",
@@ -1089,7 +1377,7 @@ class StrokeCounterApp:
                 self.config.dump(CONFIG_FILE)
                 dialog.destroy()
 
-        else:
+        elif mode == "rings":
             ringA_low_scales, ringA_high_scales = create_scale_group(
                 dialog,
                 "Ring A HSV range",
@@ -1108,6 +1396,36 @@ class StrokeCounterApp:
                 self.config.rings.ringA_high = tuple(scale.get() for scale in ringA_high_scales)
                 self.config.rings.ringB_low = tuple(scale.get() for scale in ringB_low_scales)
                 self.config.rings.ringB_high = tuple(scale.get() for scale in ringB_high_scales)
+                self.config.dump(CONFIG_FILE)
+                dialog.destroy()
+
+        else:
+            cyan_low_scales, cyan_high_scales = create_scale_group(
+                dialog,
+                "Cyan band HSV range",
+                self.config.color_dual_rings.cyan_low,
+                self.config.color_dual_rings.cyan_high,
+            )
+            magenta_low_scales, magenta_high_scales = create_scale_group(
+                dialog,
+                "Magenta band HSV range",
+                self.config.color_dual_rings.magenta_low,
+                self.config.color_dual_rings.magenta_high,
+            )
+
+            def save() -> None:
+                self.config.color_dual_rings.cyan_low = tuple(
+                    scale.get() for scale in cyan_low_scales
+                )
+                self.config.color_dual_rings.cyan_high = tuple(
+                    scale.get() for scale in cyan_high_scales
+                )
+                self.config.color_dual_rings.magenta_low = tuple(
+                    scale.get() for scale in magenta_low_scales
+                )
+                self.config.color_dual_rings.magenta_high = tuple(
+                    scale.get() for scale in magenta_high_scales
+                )
                 self.config.dump(CONFIG_FILE)
                 dialog.destroy()
 
@@ -1147,11 +1465,25 @@ class StrokeCounterApp:
         if self.current_frame is None:
             messagebox.showinfo(APP_NAME, "No frame available yet.")
             return
-        if self.config.mode == "stripe":
+        if not self.marker_homography.ready:
+            messagebox.showinfo(APP_NAME, "Lock the work area first (press R).")
+            return
+
+        mode = self.config.mode
+        if mode == "stripe":
             result = self.stripe_mode.last_result
-        else:
+            mode_config = self.config.stripe
+            mode_reset = self.stripe_mode.reset
+        elif mode == "rings":
             result = self.rings_mode.last_result
-        if result.tip_px is None or not self.marker_homography.ready:
+            mode_config = self.config.rings
+            mode_reset = self.rings_mode.reset
+        else:
+            result = self.color_dual_mode.last_result
+            mode_config = self.config.color_dual_rings
+            mode_reset = self.color_dual_mode.reset
+
+        if result.tip_px is None or result.tip_mm is None:
             messagebox.showinfo(APP_NAME, "Tip not detected yet.")
             return
 
@@ -1164,57 +1496,139 @@ class StrokeCounterApp:
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Manual tip alignment")
+        dialog.transient(self.root)
         dialog.grab_set()
+
         canvas = tk.Canvas(dialog, width=image.width, height=image.height)
         canvas.pack()
-        canvas_img = canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-        marker = canvas.create_oval(
-            result.tip_px[0] - 6,
-            result.tip_px[1] - 6,
-            result.tip_px[0] + 6,
-            result.tip_px[1] + 6,
-            outline="red",
-            fill="",
-            width=2,
-        )
+        canvas.create_image(0, 0, anchor=tk.NW, image=photo)
         canvas.image = photo  # keep reference
 
-        drag_data = {"x": result.tip_px[0], "y": result.tip_px[1]}
+        base_tip_px = np.array(result.tip_px, dtype=float)
+        base_tip_mm = np.array(result.tip_mm, dtype=float)
+        marker_radius = 10
+        marker = canvas.create_oval(
+            base_tip_px[0] - marker_radius,
+            base_tip_px[1] - marker_radius,
+            base_tip_px[0] + marker_radius,
+            base_tip_px[1] + marker_radius,
+            outline="red",
+            fill="#ff000060",
+            width=3,
+        )
 
-        def on_press(event: tk.Event) -> None:
-            drag_data["x"] = event.x
-            drag_data["y"] = event.y
+        dx_var = tk.DoubleVar(value=0.0)
+        dy_var = tk.DoubleVar(value=0.0)
+        offset_label = tk.StringVar()
+
+        def update_marker_from_mm() -> None:
+            tip_mm_live = base_tip_mm + np.array([dx_var.get(), dy_var.get()], dtype=float)
+            tip_px_live = self.marker_homography.project_mm_to_px(tip_mm_live.reshape(1, 2))[0]
+            canvas.coords(
+                marker,
+                tip_px_live[0] - marker_radius,
+                tip_px_live[1] - marker_radius,
+                tip_px_live[0] + marker_radius,
+                tip_px_live[1] + marker_radius,
+            )
+            offset_label.set(f"dx={dx_var.get():+.2f} mm  dy={dy_var.get():+.2f} mm")
+
+        def set_offsets_from_px(px: float, py: float) -> None:
+            px = float(np.clip(px, 0, image.width - 1))
+            py = float(np.clip(py, 0, image.height - 1))
+            tip_mm_live = self.marker_homography.project_px_to_mm(
+                np.array([[px, py]], dtype=float)
+            )[0]
+            delta = tip_mm_live - base_tip_mm
+            dx_var.set(float(np.round(delta[0], 3)))
+            dy_var.set(float(np.round(delta[1], 3)))
+
+        def on_click(event: tk.Event) -> None:
+            set_offsets_from_px(event.x, event.y)
 
         def on_drag(event: tk.Event) -> None:
-            dx = event.x - drag_data["x"]
-            dy = event.y - drag_data["y"]
-            canvas.move(marker, dx, dy)
-            drag_data["x"] = event.x
-            drag_data["y"] = event.y
+            set_offsets_from_px(event.x, event.y)
 
-        canvas.tag_bind(marker, "<ButtonPress-1>", on_press)
-        canvas.tag_bind(marker, "<B1-Motion>", on_drag)
+        def on_key(event: tk.Event) -> None:
+            step = 0.1
+            if event.state & 0x0001:
+                step *= 5.0
+            dx = dx_var.get()
+            dy = dy_var.get()
+            if event.keysym == "Left":
+                dx -= step
+            elif event.keysym == "Right":
+                dx += step
+            elif event.keysym == "Up":
+                dy -= step
+            elif event.keysym == "Down":
+                dy += step
+            else:
+                return
+            dx_var.set(float(np.round(dx, 3)))
+            dy_var.set(float(np.round(dy, 3)))
+
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<Key>", on_key)
+        dialog.bind("<Key>", on_key)
+        canvas.focus_set()
+
+        controls = ttk.Frame(dialog)
+        controls.pack(fill=tk.X, padx=10, pady=6)
+
+        ttk.Label(controls, text="dx (mm)").grid(row=0, column=0, padx=4, pady=4)
+        dx_spin = ttk.Spinbox(
+            controls,
+            from_=-50.0,
+            to=50.0,
+            increment=0.1,
+            textvariable=dx_var,
+            width=8,
+        )
+        dx_spin.grid(row=0, column=1, padx=4, pady=4)
+
+        ttk.Label(controls, text="dy (mm)").grid(row=0, column=2, padx=4, pady=4)
+        dy_spin = ttk.Spinbox(
+            controls,
+            from_=-50.0,
+            to=50.0,
+            increment=0.1,
+            textvariable=dy_var,
+            width=8,
+        )
+        dy_spin.grid(row=0, column=3, padx=4, pady=4)
+
+        ttk.Label(controls, textvariable=offset_label).grid(
+            row=1, column=0, columnspan=4, padx=4, pady=(0, 4)
+        )
+
+        def on_spinbox_change(*_: object) -> None:
+            update_marker_from_mm()
+
+        dx_var.trace_add("write", on_spinbox_change)
+        dy_var.trace_add("write", on_spinbox_change)
+
+        update_marker_from_mm()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(pady=8)
 
         def save() -> None:
-            coords = canvas.coords(marker)
-            x = (coords[0] + coords[2]) / 2.0
-            y = (coords[1] + coords[3]) / 2.0
-            original_tip = np.array(result.tip_px, dtype=float)
-            new_tip = np.array([x, y], dtype=float)
-            delta_mm = self.marker_homography.project_px_to_mm(new_tip.reshape(1, 2))[0] - \
-                self.marker_homography.project_px_to_mm(original_tip.reshape(1, 2))[0]
-            if self.config.mode == "stripe":
-                self.config.stripe.manual_offset_mm = tuple(
-                    (np.asarray(self.config.stripe.manual_offset_mm) + delta_mm).tolist()
-                )
-            else:
-                self.config.rings.manual_offset_mm = tuple(
-                    (np.asarray(self.config.rings.manual_offset_mm) + delta_mm).tolist()
-                )
+            delta_mm = np.array([dx_var.get(), dy_var.get()], dtype=float)
+            if float(np.linalg.norm(delta_mm)) < 1e-6:
+                dialog.destroy()
+                return
+            updated = tuple((np.asarray(mode_config.manual_offset_mm) + delta_mm).tolist())
+            mode_config.manual_offset_mm = updated
             self.config.dump(CONFIG_FILE)
+            mode_reset()
+            self.last_tip_mm = None
             dialog.destroy()
 
-        ttk.Button(dialog, text="Save", command=save).pack(pady=10)
+        ttk.Button(buttons, text="Save", command=save).grid(row=0, column=0, padx=6)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=1, padx=6)
+
 
     def _print_stripe(self) -> None:
         try:
@@ -1230,12 +1644,26 @@ class StrokeCounterApp:
         except Exception as exc:  # pragma: no cover
             messagebox.showerror(APP_NAME, f"Failed to generate PDF: {exc}")
 
+    def _print_rails(self) -> None:
+        try:
+            create_rails_pdf(
+                self.config.rails.top_ids,
+                self.config.rails.side_ids,
+                self.config.rails.marker_size_mm,
+                self.config.rails.gap_h_mm,
+                self.config.rails.gap_v_mm,
+                self.config.rails.aruco_dictionary,
+            )
+            messagebox.showinfo(APP_NAME, "Rails PDF generated.")
+        except Exception as exc:  # pragma: no cover
+            messagebox.showerror(APP_NAME, f"Failed to generate PDF: {exc}")
+
     def _show_about(self) -> None:
         messagebox.showinfo(
             APP_NAME,
             "Sofrim Stroke Counter\n\n"
             "Tracks a Torah scribe's quill to estimate writing strokes.\n"
-            "Mode: Stripe (preferred) or Rings (fallback).\n"
+            "Modes: Stripe, Rings, or Color dual-rings.\n"
             "Python 3.12 / OpenCV / Tkinter",
         )
 
@@ -1257,7 +1685,11 @@ class StrokeCounterApp:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sofrim stroke counter")
-    parser.add_argument("--mode", choices=["stripe", "rings"], help="Override detection mode")
+    parser.add_argument(
+        "--mode",
+        choices=["stripe", "rings", "color_dual_rings"],
+        help="Override detection mode",
+    )
     return parser.parse_args(argv)
 
 

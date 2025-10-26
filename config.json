@@ -23,6 +23,28 @@
     "tip_distance_mm": 14.0,
     "manual_offset_mm": [0.0, 0.0]
   },
+  "color_dual_rings": {
+    "cyan_low": [85, 120, 120],
+    "cyan_high": [100, 255, 255],
+    "magenta_low": [160, 120, 120],
+    "magenta_high": [179, 255, 255],
+    "front_to_tip_mm": 12.0,
+    "min_area_px": 150,
+    "ema_alpha": 0.25,
+    "max_jump_mm": 3.0,
+    "lost_reacq_frames": 12,
+    "roi_pad_mm": 8.0,
+    "angle_gate_deg": 25.0,
+    "manual_offset_mm": [0.0, 0.0]
+  },
+  "rails": {
+    "aruco_dictionary": "DICT_4X4_1000",
+    "marker_size_mm": 15.0,
+    "gap_h_mm": 12.0,
+    "gap_v_mm": 18.0,
+    "top_ids": [10, 11, 12, 13],
+    "side_ids": [14, 15, 16, 17]
+  },
   "ui": {
     "language": "en",
     "single_window": true
