@@ -8,8 +8,14 @@
     "tick_mm": 5.0,
     "min_area_px": 500,
     "tip_reference": "far_end",
-    "tip_offset_mm": 5.0,
-    "manual_offset_mm": [0.0, 0.0]
+    "tip_offset_mm": 50.0,
+    "manual_offset_mm": [0.0, 0.0],
+    "ema_alpha": 0.25,
+    "max_jump_mm": 3.0,
+    "min_inlier_ratio": 0.6,
+    "lost_reacq_frames": 12,
+    "roi_pad_mm": 8.0,
+    "angle_gate_deg": 25.0
   },
   "rings": {
     "ringA": {"low": [20, 90, 130], "high": [38, 255, 255]},

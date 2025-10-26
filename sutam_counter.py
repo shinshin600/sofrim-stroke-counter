@@ -90,6 +90,12 @@ class StripeConfig:
     tip_reference: str = "far_end"
     tip_offset_mm: float = 5.0
     manual_offset_mm: Tuple[float, float] = (0.0, 0.0)
+    ema_alpha: float = 0.25
+    max_jump_mm: float = 3.0
+    min_inlier_ratio: float = 0.6
+    lost_reacq_frames: int = 12
+    roi_pad_mm: float = 8.0
+    angle_gate_deg: float = 25.0
 
     @staticmethod
     def from_mapping(data: Dict[str, object]) -> "StripeConfig":
@@ -103,6 +109,12 @@ class StripeConfig:
             tip_reference=str(data.get("tip_reference", "far_end")),
             tip_offset_mm=float(data.get("tip_offset_mm", 5.0)),
             manual_offset_mm=_as_tuple(data.get("manual_offset_mm", (0.0, 0.0))),
+            ema_alpha=float(data.get("ema_alpha", 0.25)),
+            max_jump_mm=float(data.get("max_jump_mm", 3.0)),
+            min_inlier_ratio=float(data.get("min_inlier_ratio", 0.6)),
+            lost_reacq_frames=int(data.get("lost_reacq_frames", 12)),
+            roi_pad_mm=float(data.get("roi_pad_mm", 8.0)),
+            angle_gate_deg=float(data.get("angle_gate_deg", 25.0)),
         )
 
     def to_mapping(self) -> Dict[str, object]:
@@ -116,6 +128,12 @@ class StripeConfig:
             "tip_reference": self.tip_reference,
             "tip_offset_mm": self.tip_offset_mm,
             "manual_offset_mm": list(self.manual_offset_mm),
+            "ema_alpha": self.ema_alpha,
+            "max_jump_mm": self.max_jump_mm,
+            "min_inlier_ratio": self.min_inlier_ratio,
+            "lost_reacq_frames": self.lost_reacq_frames,
+            "roi_pad_mm": self.roi_pad_mm,
+            "angle_gate_deg": self.angle_gate_deg,
         }
 
 
@@ -217,6 +235,14 @@ def normalise(vector: np.ndarray) -> np.ndarray:
     if norm <= 1e-6:
         return np.zeros_like(vector)
     return vector / norm
+
+
+def angle_consistent(new_dir: np.ndarray, prev_dir: Optional[np.ndarray], max_deg: float) -> bool:
+    if prev_dir is None:
+        return True
+    c = float(np.clip(np.dot(normalise(new_dir), normalise(prev_dir)), -1.0, 1.0))
+    ang = math.degrees(math.acos(c))
+    return ang <= max_deg
 
 
 class ExponentialMovingAverage:
@@ -468,16 +494,33 @@ class StripeMode:
     def __init__(self, config: StripeConfig, homography: MarkerHomography) -> None:
         self.config = config
         self.homography = homography
-        self.tip_filter = ExponentialMovingAverage()
+        self.tip_filter = ExponentialMovingAverage(alpha=self.config.ema_alpha)
         self.last_result: StripeDetectionResult = StripeDetectionResult()
+        self.prev_tip_mm: Optional[np.ndarray] = None
+        self.prev_line_dir_mm: Optional[np.ndarray] = None
+        self.lost_counter: int = 0
 
     def reset(self) -> None:
         self.tip_filter.reset()
         self.last_result = StripeDetectionResult()
+        self.prev_tip_mm = None
+        self.prev_line_dir_mm = None
+        self.lost_counter = 0
 
     def process(self, frame: np.ndarray) -> StripeDetectionResult:
         result = StripeDetectionResult()
-        mask = self._create_mask(frame)
+        if not self.homography.ready:
+            self.reset()
+            return result
+
+        rx, ry, rw, rh = self._search_roi(frame.shape)
+        if rw <= 0 or rh <= 0:
+            self.reset()
+            return result
+
+        frame_roi = frame[ry : ry + rh, rx : rx + rw]
+
+        mask = self._create_mask(frame_roi)
         if mask is None:
             self.reset()
             return result
@@ -491,58 +534,110 @@ class StripeMode:
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            self.reset()
-            return result
+            self.lost_counter += 1
+            return self._hold_last(result, roi=(rx, ry, rw, rh))
 
-        kept_contours = [c for c in contours if cv2.contourArea(c) >= self.config.min_area_px]
-        if not kept_contours:
-            self.reset()
-            return result
+        kept = [c for c in contours if cv2.contourArea(c) >= self.config.min_area_px]
+        if not kept:
+            self.lost_counter += 1
+            return self._hold_last(result, roi=(rx, ry, rw, rh))
 
-        pts = np.vstack([c.reshape(-1, 2) for c in kept_contours]).astype(np.float32)
+        kept_shifted = []
+        for contour in kept:
+            offset = np.array([[[rx, ry]]], dtype=contour.dtype)
+            kept_shifted.append(contour + offset)
+        pts = np.vstack([c.reshape(-1, 2) for c in kept_shifted]).astype(np.float32)
 
         try:
-            point_on_line, direction = ransac_line(pts)
+            point_on_line, direction_px = ransac_line(pts)
         except ValueError:
-            self.reset()
-            return result
+            self.lost_counter += 1
+            return self._hold_last(result, roi=(rx, ry, rw, rh))
+
+        residuals = np.abs(np.cross(pts - point_on_line, direction_px))
+        inliers = residuals <= RANSAC_THRESHOLD_PX
+        inlier_ratio = float(np.count_nonzero(inliers)) / float(len(pts))
+        total_area_px = sum(cv2.contourArea(c) for c in kept)
+        area_ok = total_area_px >= self.config.min_area_px
+
+        projections = pts @ direction_px
+        far_end = pts[int(np.argmax(projections))]
+
+        far_end_mm = self.homography.project_px_to_mm(far_end.reshape(1, 2))[0]
+        near_point_px = far_end - direction_px * 10.0
+        near_point_mm = self.homography.project_px_to_mm(near_point_px.reshape(1, 2))[0]
+        axis_mm = normalise(far_end_mm - near_point_mm)
+        if np.allclose(axis_mm, 0):
+            self.lost_counter += 1
+            return self._hold_last(result, roi=(rx, ry, rw, rh))
+
+        angle_ok = angle_consistent(axis_mm, self.prev_line_dir_mm, self.config.angle_gate_deg)
+        quality_ok = area_ok and (inlier_ratio >= self.config.min_inlier_ratio) and angle_ok
+
+        if not quality_ok:
+            self.lost_counter += 1
+            return self._hold_last(result, roi=(rx, ry, rw, rh))
+
+        tip_mm_new = far_end_mm - axis_mm * self.config.tip_offset_mm
+        tip_mm_new = tip_mm_new + np.asarray(self.config.manual_offset_mm, dtype=float)
+
+        if self.prev_tip_mm is not None:
+            if float(np.linalg.norm(tip_mm_new - self.prev_tip_mm)) > self.config.max_jump_mm:
+                self.lost_counter += 1
+                return self._hold_last(result, roi=(rx, ry, rw, rh))
+
+        tip_mm_smooth = self.tip_filter.update(tip_mm_new)
+        tip_px = self.homography.project_mm_to_px(tip_mm_smooth.reshape(1, 2))[0]
 
         rect = cv2.minAreaRect(pts)
         box = cv2.boxPoints(rect).astype(np.int32)
 
-        # Determine far end of stripe
-        projections = pts @ direction
-        far_end = pts[int(np.argmax(projections))]
-
-        # Determine axis direction in millimetres
-        if not self.homography.ready:
-            self.reset()
-            return result
-
-        far_end_mm = self.homography.project_px_to_mm(far_end.reshape(1, 2))[0]
-        near_point_px = far_end - direction * 10.0
-        near_point_mm = self.homography.project_px_to_mm(near_point_px.reshape(1, 2))[0]
-        axis_mm = far_end_mm - near_point_mm
-        axis_mm = normalise(axis_mm)
-        if np.allclose(axis_mm, 0):
-            self.reset()
-            return result
-
-        tip_mm = far_end_mm - axis_mm * self.config.tip_offset_mm
-        manual_offset = np.asarray(self.config.manual_offset_mm, dtype=float)
-        tip_mm = tip_mm + manual_offset
-
-        tip_px = self.homography.project_mm_to_px(tip_mm.reshape(1, 2))[0]
-        tip_px = self.tip_filter.update(tip_px)
-
-        roi = self._roi_from_tip(frame, tip_px, tip_mm)
+        self.prev_tip_mm = tip_mm_smooth.copy()
+        self.prev_line_dir_mm = axis_mm.copy()
+        self.lost_counter = 0
 
         result.tip_px = tip_px
-        result.tip_mm = tip_mm
+        result.tip_mm = tip_mm_smooth
         result.far_end_px = far_end
-        result.contour = max(kept_contours, key=cv2.contourArea)
+        result.contour = max(kept_shifted, key=cv2.contourArea)
         result.bounding_box = box
+        result.roi = (rx, ry, rw, rh)
+        self.last_result = result
+        return result
+
+    def _search_roi(self, frame_shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
+        if (
+            self.prev_tip_mm is None
+            or self.lost_counter >= self.config.lost_reacq_frames
+            or not self.homography.ready
+        ):
+            height, width = frame_shape[0], frame_shape[1]
+            return (0, 0, width, height)
+
+        pad_px = int(self.config.roi_pad_mm * 1.0)
+        cx, cy = self.homography.project_mm_to_px(self.prev_tip_mm.reshape(1, 2))[0]
+        cx = int(cx)
+        cy = int(cy)
+
+        anchor = self.prev_tip_mm + np.array([10.0, 0.0])
+        a = self.homography.project_mm_to_px(anchor.reshape(1, 2))[0]
+        mm2px = max(1.0, float(np.linalg.norm(a - np.array([cx, cy], dtype=float)) / 10.0))
+        pad_px = int(self.config.roi_pad_mm * mm2px)
+
+        x1 = max(0, cx - pad_px)
+        y1 = max(0, cy - pad_px)
+        x2 = min(frame_shape[1], cx + pad_px)
+        y2 = min(frame_shape[0], cy + pad_px)
+        return (x1, y1, x2 - x1, y2 - y1)
+
+    def _hold_last(
+        self, result: StripeDetectionResult, roi: Tuple[int, int, int, int]
+    ) -> StripeDetectionResult:
         result.roi = roi
+        if self.prev_tip_mm is not None and self.homography.ready:
+            tip_px = self.homography.project_mm_to_px(self.prev_tip_mm.reshape(1, 2))[0]
+            result.tip_px = tip_px
+            result.tip_mm = self.prev_tip_mm.copy()
         self.last_result = result
         return result
 
