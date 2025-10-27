@@ -393,7 +393,7 @@ class ExponentialMovingAverage:
 class InkActivityTracker:
     """Maintains a smoothed ink activity signal and pen state."""
 
-    def __init__(self, window_size: int = 12, threshold_on: float = 6.0, threshold_off: float = 3.0):
+    def __init__(self, window_size: int = 12, threshold_on: float = 4.0, threshold_off: float = 2.0):
         self.window_size = int(window_size)
         self.threshold_on = float(threshold_on)
         self.threshold_off = float(threshold_off)
@@ -815,7 +815,7 @@ class StripeMode:
     ) -> Optional[Tuple[int, int, int, int]]:
         if not self.homography.ready:
             return None
-        radius_mm = 3.0
+        radius_mm = 5.0
         offsets_mm = np.array([
             tip_mm + [-radius_mm, -radius_mm],
             tip_mm + [radius_mm, radius_mm],
@@ -904,8 +904,8 @@ class RingsMode:
         if not self.homography.ready:
             return None
         offsets_mm = np.array([
-            tip_mm + [-3.0, -3.0],
-            tip_mm + [3.0, 3.0],
+            tip_mm + [-5.0, -5.0],
+            tip_mm + [5.0, 5.0],
         ])
         roi_pts_px = self.homography.project_mm_to_px(offsets_mm)
         size_px = np.mean(np.abs(roi_pts_px[1] - roi_pts_px[0]))
