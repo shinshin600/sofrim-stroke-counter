@@ -346,7 +346,7 @@ class ExponentialMovingAverage:
 class InkActivityTracker:
     """Maintains a smoothed ink activity signal and pen state."""
 
-    def __init__(self, window_size: int = 24, threshold_on: float = 14.0, threshold_off: float = 7.0):
+    def __init__(self, window_size: int = 12, threshold_on: float = 6.0, threshold_off: float = 3.0):
         self.window_size = int(window_size)
         self.threshold_on = float(threshold_on)
         self.threshold_off = float(threshold_off)
@@ -1284,18 +1284,29 @@ class StrokeCounterApp:
             x, y, w, h = result.roi
             cv2.rectangle(overlay, (x, y), (x + w, y + h), (255, 255, 0), 1)
 
-        text = f"Mode: {self.config.mode}  Strokes: {self.stroke_count}  Refine: {self.refine_count}  Ink:{activity:.1f}"
-        cv2.putText(overlay, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        if pen_down:
-            cv2.putText(overlay, "PEN DOWN", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        # Compact, scalable HUD (prevents clipping on small windows)
+        h, w = overlay.shape[:2]
+        font_scale = 0.7 * (w / 1280.0)
+        font_scale = max(0.5, min(font_scale, 0.9))  # clamp for typical laptops
 
-        helper_text = "Keys: R=re-lock S=screenshot ESC=quit"
+        status_text = f"{self.config.mode}  S:{self.stroke_count}  R:{self.refine_count}  I:{activity:.1f}"
         cv2.putText(
             overlay,
-            helper_text,
-            (20, overlay.shape[0] - 20),
+            status_text,
+            (14, int(36 * font_scale / 0.7)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            font_scale,
+            (255, 255, 255),
+            2,
+        )
+
+        help_text = "Keys: R=re-lock  S=screenshot  ESC=quit"
+        cv2.putText(
+            overlay,
+            help_text,
+            (14, h - int(14 * font_scale / 0.7)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale * 0.85,
             (180, 255, 180),
             2,
         )
