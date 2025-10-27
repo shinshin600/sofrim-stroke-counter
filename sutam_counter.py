@@ -1606,7 +1606,7 @@ class StrokeCounterApp:
 
         frame = self.current_frame.copy()
         overlay = frame.copy()
-        cv2.circle(overlay, tuple(int(v) for v in result.tip_px), 6, (0, 0, 255), -1)
+        cv2.circle(overlay, tuple(int(v) for v in result.tip_px), 8, (0, 0, 255), -1)
         rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
         photo = ImageTk.PhotoImage(image=image)
@@ -1618,19 +1618,19 @@ class StrokeCounterApp:
 
         canvas = tk.Canvas(dialog, width=image.width, height=image.height)
         canvas.pack()
-        canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+        canvas_image = canvas.create_image(0, 0, anchor=tk.NW, image=photo)
         canvas.image = photo  # keep reference
 
         base_tip_px = np.array(result.tip_px, dtype=float)
         base_tip_mm = np.array(result.tip_mm, dtype=float)
-        marker_radius = 10
+        marker_radius = 8
         marker = canvas.create_oval(
             base_tip_px[0] - marker_radius,
             base_tip_px[1] - marker_radius,
             base_tip_px[0] + marker_radius,
             base_tip_px[1] + marker_radius,
             outline="red",
-            fill="#ff000060",
+            fill="#ff0000",
             width=3,
         )
 
@@ -1660,33 +1660,49 @@ class StrokeCounterApp:
             dx_var.set(float(np.round(delta[0], 3)))
             dy_var.set(float(np.round(delta[1], 3)))
 
-        def on_click(event: tk.Event) -> None:
+        def on_click(event: tk.Event) -> str:
+            canvas.focus_set()
             set_offsets_from_px(event.x, event.y)
+            return "break"
 
-        def on_drag(event: tk.Event) -> None:
+        def on_drag(event: tk.Event) -> str:
             set_offsets_from_px(event.x, event.y)
+            return "break"
+
+        def nudge_marker(dx_px: float, dy_px: float) -> None:
+            tip_mm_live = base_tip_mm + np.array([dx_var.get(), dy_var.get()], dtype=float)
+            tip_px_live = self.marker_homography.project_mm_to_px(
+                tip_mm_live.reshape(1, 2)
+            )[0]
+            tip_px_live[0] = float(np.clip(tip_px_live[0] + dx_px, 0, image.width - 1))
+            tip_px_live[1] = float(np.clip(tip_px_live[1] + dy_px, 0, image.height - 1))
+            tip_mm_live = self.marker_homography.project_px_to_mm(
+                tip_px_live.reshape(1, 2)
+            )[0]
+            delta = tip_mm_live - base_tip_mm
+            dx_var.set(float(np.round(delta[0], 3)))
+            dy_var.set(float(np.round(delta[1], 3)))
 
         def on_key(event: tk.Event) -> None:
-            step = 0.1
+            step_px = 2.0
             if event.state & 0x0001:
-                step *= 5.0
-            dx = dx_var.get()
-            dy = dy_var.get()
+                step_px *= 5.0
             if event.keysym == "Left":
-                dx -= step
+                nudge_marker(-step_px, 0.0)
             elif event.keysym == "Right":
-                dx += step
+                nudge_marker(step_px, 0.0)
             elif event.keysym == "Up":
-                dy -= step
+                nudge_marker(0.0, -step_px)
             elif event.keysym == "Down":
-                dy += step
+                nudge_marker(0.0, step_px)
             else:
                 return
-            dx_var.set(float(np.round(dx, 3)))
-            dy_var.set(float(np.round(dy, 3)))
+            return "break"
 
-        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<ButtonPress-1>", on_click)
         canvas.bind("<B1-Motion>", on_drag)
+        canvas.tag_bind(canvas_image, "<ButtonPress-1>", on_click)
+        canvas.tag_bind(canvas_image, "<B1-Motion>", on_drag)
         canvas.bind("<Key>", on_key)
         dialog.bind("<Key>", on_key)
         canvas.focus_set()
