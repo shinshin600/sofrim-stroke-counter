@@ -24,6 +24,8 @@ import argparse
 import dataclasses
 import json
 import math
+import os
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -52,6 +54,7 @@ if not hasattr(cv2, "aruco"):
 
 
 APP_NAME = "Sofrim Stroke Counter"
+APP_VERSION = "0.2.0"
 CONFIG_FILE = Path("config.json")
 DEFAULT_FRAME_SIZE = (1920, 1080)
 DEFAULT_FPS = 30
@@ -61,6 +64,44 @@ ARUCO_DICTIONARY_ID = cv2.aruco.DICT_4X4_1000
 RANSAC_ITERATIONS = 200
 RANSAC_THRESHOLD_PX = 2.5
 EMA_ALPHA = 0.25
+
+
+def get_git_info() -> Tuple[str, str]:
+    """Return (branch, short_hash). Fallback to ('unknown', 'unknown')."""
+
+    try:
+        repo_dir = Path(__file__).resolve().parent
+        env = os.environ.copy()
+        short_hash = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            cwd=str(repo_dir),
+            env=env,
+        ).strip()
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            cwd=str(repo_dir),
+            env=env,
+        ).strip()
+        return branch, short_hash
+    except Exception:
+        return "unknown", "unknown"
+
+
+def get_build_string() -> str:
+    version = APP_VERSION
+    try:
+        here = Path(__file__).resolve().parent
+        version_file = here / "VERSION"
+        if version_file.exists():
+            version = version_file.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    _, short_hash = get_git_info()
+    return f"v{version} ({short_hash})" if short_hash != "unknown" else f"v{version}"
 
 
 # ---------------------------------------------------------------------------
@@ -1054,8 +1095,9 @@ class StrokeCounterApp:
         self.config = config
         if mode_override:
             self.config.mode = mode_override
+        self._build_string = get_build_string()
         self.root = tk.Tk()
-        self.root.title(APP_NAME)
+        self.root.title(f"{APP_NAME} — {self._build_string}")
         self.root.protocol("WM_DELETE_WINDOW", self._on_exit)
         self.root.bind("<KeyPress>", self._on_key_press)
         self.video_label = ttk.Label(self.root)
@@ -1178,6 +1220,8 @@ class StrokeCounterApp:
         self.color_dual_mode.reset()
         self.status_var.set(f"Camera {index} active - waiting for ArUco markers...")
         self._schedule_update()
+        branch, short_hash = get_git_info()
+        print(f"[INFO] {APP_NAME} {self._build_string} — branch={branch} commit={short_hash}")
 
     def stop(self) -> None:
         self.running = False
@@ -1286,6 +1330,17 @@ class StrokeCounterApp:
 
         # Compact, scalable HUD (prevents clipping on small windows)
         h, w = overlay.shape[:2]
+        wm_scale = max(0.5, min(0.8, w / 1600.0))
+        cv2.putText(
+            overlay,
+            self._build_string,
+            (14, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            wm_scale,
+            (200, 200, 200),
+            2,
+        )
+
         font_scale = 0.7 * (w / 1280.0)
         font_scale = max(0.5, min(font_scale, 0.9))  # clamp for typical laptops
 
@@ -1803,9 +1858,13 @@ class StrokeCounterApp:
             messagebox.showerror(APP_NAME, f"Failed to generate PDF: {exc}")
 
     def _show_about(self) -> None:
+        branch, short_hash = get_git_info()
         messagebox.showinfo(
             APP_NAME,
-            "Sofrim Stroke Counter\n\n"
+            f"Sofrim Stroke Counter\n"
+            f"Build: {self._build_string}\n"
+            f"Branch: {branch}\n"
+            f"Commit: {short_hash}\n\n"
             "Tracks a Torah scribe's quill to estimate writing strokes.\n"
             "Modes: Stripe, Rings, or Color dual-rings.\n"
             "Python 3.12 / OpenCV / Tkinter",
@@ -1834,11 +1893,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=["stripe", "rings", "color_dual_rings"],
         help="Override detection mode",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print version information and exit",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
+    if getattr(args, "version", False):
+        print(get_build_string())
+        return
     config = AppConfig.load(CONFIG_FILE)
     app = StrokeCounterApp(config, mode_override=getattr(args, "mode", None))
     app.run()
