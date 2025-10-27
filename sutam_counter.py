@@ -207,6 +207,8 @@ class ColorDualRingsConfig:
     magenta_low: Tuple[int, int, int] = (160, 120, 120)
     magenta_high: Tuple[int, int, int] = (179, 255, 255)
     front_to_tip_mm: float = 12.0
+    nib_lateral_mm: float = 0.0
+    nib_side: str = "left"
     min_area_px: int = 150
     ema_alpha: float = 0.25
     max_jump_mm: float = 3.0
@@ -223,6 +225,8 @@ class ColorDualRingsConfig:
             magenta_low=tuple(int(v) for v in data.get("magenta_low", (160, 120, 120))),
             magenta_high=tuple(int(v) for v in data.get("magenta_high", (179, 255, 255))),
             front_to_tip_mm=float(data.get("front_to_tip_mm", 12.0)),
+            nib_lateral_mm=float(data.get("nib_lateral_mm", 0.0)),
+            nib_side=str(data.get("nib_side", "left")),
             min_area_px=int(data.get("min_area_px", 150)),
             ema_alpha=float(data.get("ema_alpha", 0.25)),
             max_jump_mm=float(data.get("max_jump_mm", 3.0)),
@@ -239,6 +243,8 @@ class ColorDualRingsConfig:
             "magenta_low": list(self.magenta_low),
             "magenta_high": list(self.magenta_high),
             "front_to_tip_mm": self.front_to_tip_mm,
+            "nib_lateral_mm": self.nib_lateral_mm,
+            "nib_side": self.nib_side,
             "min_area_px": self.min_area_px,
             "ema_alpha": self.ema_alpha,
             "max_jump_mm": self.max_jump_mm,
@@ -1006,9 +1012,14 @@ class ColorDualRingsMode:
             self.lost_counter += 1
             return self._hold_last(result, roi)
 
+        normal_mm = np.array([-axis_mm[1], axis_mm[0]], dtype=float)
+        if self.config.nib_side.lower() == "right":
+            normal_mm = -normal_mm
+
         tip_mm_new = (
             cyan_center_mm
             - axis_mm * float(self.config.front_to_tip_mm)
+            + normal_mm * float(self.config.nib_lateral_mm)
             + np.asarray(self.config.manual_offset_mm, dtype=float)
         )
 
@@ -1156,6 +1167,9 @@ class StrokeCounterApp:
 
         tools_menu = tk.Menu(menu_bar, tearoff=False)
         tools_menu.add_command(label="Color calibration…", command=self._color_calibration)
+        tools_menu.add_command(
+            label="Calibrate colors from clicks…", command=self._click_color_calibration
+        )
         tools_menu.add_command(label="Select camera…", command=self._select_camera)
         tools_menu.add_command(label="Manual tip set…", command=self._manual_tip_adjust)
         menu_bar.add_cascade(label="Tools", menu=tools_menu)
@@ -1386,6 +1400,147 @@ class StrokeCounterApp:
             return
         cv2.imwrite(filename, self.current_frame)
         self.status_var.set(f"Saved screenshot to {filename}")
+
+    def _click_color_calibration(self) -> None:
+        if self.current_frame is None:
+            messagebox.showinfo(APP_NAME, "No frame available yet.")
+            return
+        if not self.marker_homography.ready:
+            messagebox.showinfo(APP_NAME, "Lock the work area first (press R).")
+            return
+
+        frame = self.current_frame.copy()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb)
+        photo = ImageTk.PhotoImage(image=image)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Dual-ring colour calibration")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        instructions = tk.StringVar(value="Click the CYAN ring")
+        ttk.Label(dialog, textvariable=instructions).pack(padx=10, pady=(10, 4))
+
+        canvas = tk.Canvas(dialog, width=image.width, height=image.height)
+        canvas.pack()
+        canvas_image = canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+        canvas.image = photo  # keep reference
+
+        bounds_preview: Optional[int] = None
+        patch_size = 15
+
+        def bounds(arr: np.ndarray, low_pad: int, high_pad: int, lo_cap: int, hi_cap: int) -> Tuple[int, int]:
+            lo = int(max(lo_cap, np.percentile(arr, 10) - low_pad))
+            hi = int(min(hi_cap, np.percentile(arr, 90) + high_pad))
+            return lo, hi
+
+        def derive_hsv(x: int, y: int) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+            half = patch_size // 2
+            x1 = max(0, x - half)
+            x2 = min(frame.shape[1], x + half + 1)
+            y1 = max(0, y - half)
+            y2 = min(frame.shape[0], y + half + 1)
+            patch = frame[y1:y2, x1:x2]
+            if patch.size == 0:
+                raise ValueError("Patch out of bounds")
+            hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            h_channel = hsv[:, :, 0].ravel()
+            s_channel = hsv[:, :, 1].ravel()
+            v_channel = hsv[:, :, 2].ravel()
+            h_low, h_high = bounds(h_channel, 5, 5, 0, 179)
+            s_low, s_high = bounds(s_channel, 30, 30, 0, 255)
+            v_low, v_high = bounds(v_channel, 30, 30, 0, 255)
+            return (h_low, s_low, v_low), (h_high, s_high, v_high)
+
+        result_cyan: Optional[Tuple[Tuple[int, int, int], Tuple[int, int, int]]] = None
+        result_magenta: Optional[Tuple[Tuple[int, int, int], Tuple[int, int, int]]] = None
+
+        cyan_label = tk.StringVar(value="Cyan HSV: –")
+        magenta_label = tk.StringVar(value="Magenta HSV: –")
+
+        ttk.Label(dialog, textvariable=cyan_label).pack(padx=10, pady=(6, 0))
+        ttk.Label(dialog, textvariable=magenta_label).pack(padx=10, pady=(0, 6))
+
+        def update_preview(x: int, y: int) -> None:
+            nonlocal bounds_preview
+            if bounds_preview is not None:
+                canvas.delete(bounds_preview)
+            half = patch_size // 2
+            bounds_preview = canvas.create_rectangle(
+                x - half,
+                y - half,
+                x + half,
+                y + half,
+                outline="#00ffff" if instructions.get().startswith("Click the CYAN") else "#ff00ff",
+                width=2,
+            )
+
+        step = "cyan"
+
+        def on_click(event: tk.Event) -> str:
+            nonlocal result_cyan, result_magenta, step
+            x = int(np.clip(event.x, 0, frame.shape[1] - 1))
+            y = int(np.clip(event.y, 0, frame.shape[0] - 1))
+            try:
+                low, high = derive_hsv(x, y)
+            except ValueError:
+                return "break"
+            update_preview(x, y)
+            if step == "cyan":
+                result_cyan = (low, high)
+                cyan_label.set(
+                    "Cyan HSV: low={} high={}".format(
+                        list(low),
+                        list(high),
+                    )
+                )
+                instructions.set("Click the MAGENTA ring")
+                step = "magenta"
+            else:
+                result_magenta = (low, high)
+                magenta_label.set(
+                    "Magenta HSV: low={} high={}".format(
+                        list(low),
+                        list(high),
+                    )
+                )
+                instructions.set("Review ranges and press Save")
+            return "break"
+
+        canvas.bind("<ButtonPress-1>", on_click)
+        canvas.tag_bind(canvas_image, "<ButtonPress-1>", on_click)
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(pady=8)
+
+        def close_dialog() -> None:
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        def on_save() -> None:
+            if result_cyan is None or result_magenta is None:
+                messagebox.showinfo(APP_NAME, "Click both rings before saving.")
+                return
+            cfg = self.config.color_dual_rings
+            cfg.cyan_low = tuple(int(v) for v in result_cyan[0])
+            cfg.cyan_high = tuple(int(v) for v in result_cyan[1])
+            cfg.magenta_low = tuple(int(v) for v in result_magenta[0])
+            cfg.magenta_high = tuple(int(v) for v in result_magenta[1])
+            self.config.dump(CONFIG_FILE)
+            self.color_dual_mode.reset()
+            self.last_tip_mm = None
+            self.status_var.set("Updated cyan/magenta HSV ranges from clicks")
+            close_dialog()
+
+        ttk.Button(buttons, text="Save", command=on_save).grid(row=0, column=0, padx=6)
+        ttk.Button(buttons, text="Cancel", command=close_dialog).grid(row=0, column=1, padx=6)
+
+        dialog.bind("<Escape>", lambda event: (close_dialog(), "break"))
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
     def _color_calibration(self) -> None:
         class ScrollableFrame(ttk.Frame):
@@ -1825,8 +1980,39 @@ class StrokeCounterApp:
             self.last_tip_mm = None
             dialog.destroy()
 
+        def auto_derive_offsets() -> None:
+            if mode != "color_dual_rings":
+                messagebox.showinfo(
+                    APP_NAME,
+                    "Auto-derived offsets are only available in the color dual-rings mode.",
+                )
+                return
+            axis = self.color_dual_mode.prev_line_dir_mm
+            if axis is None or float(np.linalg.norm(axis)) <= 1e-6:
+                messagebox.showinfo(APP_NAME, "Tip direction unavailable; move the pen and try again.")
+                return
+            axis = normalise(axis)
+            tip_mm_live = base_tip_mm + np.array([dx_var.get(), dy_var.get()], dtype=float)
+            delta = tip_mm_live - base_tip_mm
+            normal_vec = np.array([-axis[1], axis[0]], dtype=float)
+            parallel = float(np.dot(delta, axis))
+            lateral_signed = float(np.dot(delta, normal_vec))
+            cfg = self.config.color_dual_rings
+            cfg.front_to_tip_mm = max(0.0, float(cfg.front_to_tip_mm - parallel))
+            cfg.nib_lateral_mm = abs(lateral_signed)
+            cfg.nib_side = "left" if lateral_signed >= 0 else "right"
+            cfg.manual_offset_mm = (0.0, 0.0)
+            self.config.dump(CONFIG_FILE)
+            mode_reset()
+            self.last_tip_mm = None
+            self.status_var.set("Derived nib offsets from manual alignment")
+            dialog.destroy()
+
         ttk.Button(buttons, text="Save", command=save).grid(row=0, column=0, padx=6)
-        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=1, padx=6)
+        ttk.Button(buttons, text="Auto-derive nib offsets", command=auto_derive_offsets).grid(
+            row=0, column=1, padx=6
+        )
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=2, padx=6)
 
 
     def _print_stripe(self) -> None:
