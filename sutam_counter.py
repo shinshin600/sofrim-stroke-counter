@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import logging
 import math
 import os
 import subprocess
@@ -34,6 +35,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from logging.handlers import RotatingFileHandler
 from PIL import Image, ImageTk
 
 try:
@@ -64,6 +66,18 @@ ARUCO_DICTIONARY_ID = cv2.aruco.DICT_4X4_1000
 RANSAC_ITERATIONS = 200
 RANSAC_THRESHOLD_PX = 2.5
 EMA_ALPHA = 0.25
+
+
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("sofrim")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    handler = RotatingFileHandler("sofrim.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    handler.setFormatter(fmt)
+    logger.addHandler(handler)
+    return logger
 
 
 def get_git_info() -> Tuple[str, str, str]:
@@ -338,6 +352,7 @@ class AppConfig:
     color_dual_rings: ColorDualRingsConfig = field(default_factory=ColorDualRingsConfig)
     rails: RailsConfig = field(default_factory=RailsConfig)
     ui: UIConfig = field(default_factory=UIConfig)
+    ink_activity: Dict[str, float] = field(default_factory=dict)
 
     @staticmethod
     def load(path: Path) -> "AppConfig":
@@ -345,7 +360,7 @@ class AppConfig:
             return AppConfig()
         with path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
-        return AppConfig(
+        cfg = AppConfig(
             mode=str(data.get("mode", "stripe")),
             stripe=StripeConfig.from_mapping(data.get("stripe", {})),
             rings=RingsConfig.from_mapping(data.get("rings", {})),
@@ -353,7 +368,8 @@ class AppConfig:
             rails=RailsConfig.from_mapping(data.get("rails", {})),
             ui=UIConfig.from_mapping(data.get("ui", {})),
         )
-
+        cfg.ink_activity = dict(data.get("ink_activity", {}))
+        return cfg
     def dump(self, path: Path) -> None:
         payload = {
             "mode": self.mode,
@@ -362,6 +378,7 @@ class AppConfig:
             "color_dual_rings": self.color_dual_rings.to_mapping(),
             "rails": self.rails.to_mapping(),
             "ui": self.ui.to_mapping(),
+            "ink_activity": self.ink_activity,
         }
         with path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
@@ -419,58 +436,57 @@ class ExponentialMovingAverage:
 
 
 class InkActivityTracker:
-    """Maintains a smoothed ink activity signal and pen state, robust to ROI size changes."""
+    """Ink-activity with smoothing + hysteresis (frames-on/off)."""
 
-    def __init__(self, window_size: int = 18, threshold_on: float = 3.0, threshold_off: float = 1.5):
+    def __init__(self, window_size: int = 24, threshold_on: float = 6.0, threshold_off: float = 3.0,
+                 frames_on: int = 3, frames_off: int = 6):
         self.window_size = int(window_size)
         self.threshold_on = float(threshold_on)
         self.threshold_off = float(threshold_off)
+        self.frames_on_req = int(frames_on)
+        self.frames_off_req = int(frames_off)
         self.queue: List[float] = []
         self.prev_roi: Optional[np.ndarray] = None
         self.pen_down = False
+        self._above = 0
+        self._below = 0
 
     def clear(self) -> None:
         self.queue.clear()
         self.prev_roi = None
         self.pen_down = False
-
-    @staticmethod
-    def _prep(img: np.ndarray) -> np.ndarray:
-        """Normalise ROI to float grayscale and lightly denoise to reduce flicker."""
-
-        if img.ndim == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        img = cv2.GaussianBlur(img, (3, 3), 0)
-        return img.astype(np.float32) / 255.0
+        self._above = 0
+        self._below = 0
 
     def update(self, roi_gray: Optional[np.ndarray]) -> Tuple[bool, float]:
         if roi_gray is None or roi_gray.size == 0:
             self.clear()
             return False, 0.0
 
-        cur = self._prep(roi_gray)
-
         activity = 0.0
-        if self.prev_roi is not None:
-            prev_resized = cv2.resize(
-                self.prev_roi, (cur.shape[1], cur.shape[0]), interpolation=cv2.INTER_AREA
-            )
-            diff = cv2.absdiff(cur, prev_resized)
-            activity = float(diff.mean() * 255.0)
+        if self.prev_roi is not None and self.prev_roi.shape == roi_gray.shape:
+            diff = cv2.absdiff(roi_gray, self.prev_roi)
+            activity = float(np.mean(diff))
+        self.prev_roi = roi_gray.copy()
 
-        self.prev_roi = cur
         self.queue.append(activity)
         if len(self.queue) > self.window_size:
             self.queue.pop(0)
-
         smoothed = float(np.mean(self.queue)) if self.queue else 0.0
 
-        if self.pen_down:
-            if smoothed < self.threshold_off:
-                self.pen_down = False
+        # hysteresis
+        if smoothed > self.threshold_on:
+            self._above += 1; self._below = 0
+        elif smoothed < self.threshold_off:
+            self._below += 1; self._above = 0
         else:
-            if smoothed > self.threshold_on:
-                self.pen_down = True
+            self._above = max(0, self._above - 1)
+            self._below = max(0, self._below - 1)
+
+        if not self.pen_down and self._above >= self.frames_on_req:
+            self.pen_down = True; self._above = 0
+        elif self.pen_down and self._below >= self.frames_off_req:
+            self.pen_down = False; self._below = 0
 
         return self.pen_down, smoothed
 
@@ -1182,6 +1198,7 @@ class StrokeCounterApp:
         self._build_string = get_build_string()
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} — {self._build_string}")
+        self.log = setup_logger()
         self.root.protocol("WM_DELETE_WINDOW", self._on_exit)
         self.root.bind("<KeyPress>", self._on_key_press)
         self.video_label = ttk.Label(self.root)
@@ -1201,8 +1218,14 @@ class StrokeCounterApp:
         self.color_dual_mode = ColorDualRingsMode(
             self.config.color_dual_rings, self.marker_homography
         )
-        # More sensitive ink detection so שתראה PEN DOWN גם בתנועות קטנות
-        self.ink_tracker = InkActivityTracker(window_size=18, threshold_on=2.0, threshold_off=1.0)
+        ia = self.config.ink_activity or {}
+        self.ink_tracker = InkActivityTracker(
+            window_size=int(ia.get("window_size", 24)),
+            threshold_on=float(ia.get("threshold_on", 6.0)),
+            threshold_off=float(ia.get("threshold_off", 3.0)),
+            frames_on=int(ia.get("frames_on", 3)),
+            frames_off=int(ia.get("frames_off", 6)),
+        )
         self.stroke_count = 0
         self.refine_count = 0
         self.last_tip_mm: Optional[np.ndarray] = None
@@ -1212,6 +1235,7 @@ class StrokeCounterApp:
         self._frame_lock = threading.Lock()
         self._update_timer: Optional[str] = None
         self._color_dialog_geometry: Optional[str] = None
+        self._last_sample_bucket: Optional[int] = None
 
     def _on_key_press(self, event: tk.Event) -> None:
         keysym = event.keysym.lower()
@@ -1306,6 +1330,7 @@ class StrokeCounterApp:
         self.stripe_mode.reset()
         self.rings_mode.reset()
         self.color_dual_mode.reset()
+        self._last_sample_bucket = None
         self.status_var.set(f"Camera {index} active - waiting for ArUco markers...")
         self._schedule_update()
         branch, short_hash, last_update_iso = get_git_info()
@@ -1313,6 +1338,7 @@ class StrokeCounterApp:
             f"[INFO] {APP_NAME} {self._build_string} — "
             f"branch={branch} commit={short_hash} updated={last_update_iso}"
         )
+        self.log.info("app_start | build=%s | mode=%s", self._build_string, self.config.mode)
 
     def stop(self) -> None:
         self.running = False
@@ -1348,6 +1374,10 @@ class StrokeCounterApp:
         corners, ids = self.marker_homography.update(frame)
         if not was_locked and self.marker_homography.is_locked:
             self.status_var.set("Work area locked")
+            ids_list = ids.flatten().tolist() if ids is not None else []
+            self.log.info("aruco_lock | ids=%s", ids_list)
+        elif was_locked and not self.marker_homography.is_locked:
+            self.log.info("aruco_lost")
         mode = self.config.mode
         if mode == "stripe":
             result = self.stripe_mode.process(frame)
@@ -1360,19 +1390,58 @@ class StrokeCounterApp:
             tip_px = result.tip_px
 
         roi_gray = None
-        if result.roi is not None:
-            x, y, w, h = result.roi
-            roi = frame[y : y + h, x : x + w]
-            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        roi_for_log: Optional[Tuple[int, int, int, int]] = None
+
+        roi_rect = result.roi
+        if tip_px is not None:
+            ia = self.config.ink_activity or {}
+            side_px = int(ia.get("roi_side_px", 64))
+            cx, cy = int(tip_px[0]), int(tip_px[1])
+            x = max(0, cx - side_px // 2)
+            y = max(0, cy - side_px // 2)
+            x2 = min(frame.shape[1], x + side_px)
+            y2 = min(frame.shape[0], y + side_px)
+            w, h = x2 - x, y2 - y
+            roi_rect = (x, y, w, h)
+
+        if roi_rect is not None:
+            x, y, w, h = roi_rect
+            if w > 0 and h > 0:
+                roi = frame[y : y + h, x : x + w]
+                roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                roi_for_log = (x, y, w, h)
+            else:
+                roi_rect = None
 
         pen_down, activity = self.ink_tracker.update(roi_gray)
+
+        if pen_down != self.pen_down:
+            self.log.info(
+                "pen_state | down=%s | I=%.2f | S=%d | R=%d | roi=%s",
+                pen_down,
+                activity,
+                self.stroke_count,
+                self.refine_count,
+                roi_for_log,
+            )
 
         if pen_down and not self.pen_down:
             self.stroke_count += 1
             self.last_pen_down_time = time.time()
-        if not pen_down and self.pen_down:
+        elif not pen_down and self.pen_down:
             self.last_pen_up_time = time.time()
         self.pen_down = pen_down
+
+        bucket = int(time.time() * 10)
+        if bucket != self._last_sample_bucket:
+            self._last_sample_bucket = bucket
+            self.log.info(
+                "sample | I=%.2f | S=%d | R=%d | mode=%s",
+                activity,
+                self.stroke_count,
+                self.refine_count,
+                self.config.mode,
+            )
 
         if pen_down and tip_px is not None:
             if self.last_tip_mm is not None and result.tip_mm is not None:
@@ -1415,9 +1484,8 @@ class StrokeCounterApp:
                 )
         if tip_px is not None:
             cv2.circle(overlay, tuple(int(v) for v in tip_px), 6, (0, 0, 255), -1)
-        if result.roi is not None:
-            x, y, w, h = result.roi
-            # קו עבה יותר כדי שלא “ייעלם” על המסך
+        if roi_rect is not None:
+            x, y, w, h = roi_rect
             cv2.rectangle(overlay, (x, y), (x + w, y + h), (255, 255, 0), 2)
 
         # Compact, scalable HUD (prevents clipping on small windows)
@@ -1436,7 +1504,7 @@ class StrokeCounterApp:
         font_scale = 0.7 * (w / 1280.0)
         font_scale = max(0.5, min(font_scale, 0.9))  # clamp for typical laptops
 
-        pd_flag = "  PEN DOWN" if pen_down else ""
+        pd_flag = "  PEN DOWN" if self.pen_down else ""
         status_text = f"{self.config.mode}  S:{self.stroke_count}  R:{self.refine_count}  I:{activity:.1f}{pd_flag}"
         cv2.putText(
             overlay,
@@ -1469,7 +1537,7 @@ class StrokeCounterApp:
             (255, 255, 255),
             2,
         )
-        if pen_down:
+        if self.pen_down:
             cv2.putText(
                 overlay,
                 "PEN DOWN",
