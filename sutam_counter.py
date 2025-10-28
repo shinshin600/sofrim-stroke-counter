@@ -66,8 +66,12 @@ RANSAC_THRESHOLD_PX = 2.5
 EMA_ALPHA = 0.25
 
 
-def get_git_info() -> Tuple[str, str]:
-    """Return (branch, short_hash). Fallback to ('unknown', 'unknown')."""
+def get_git_info() -> Tuple[str, str, str]:
+    """Return (branch, short_hash, last_update_iso).
+
+    last_update_iso is the ISO datetime of the last commit (git),
+    or the file mtime if git is unavailable.
+    """
 
     try:
         repo_dir = Path(__file__).resolve().parent
@@ -86,9 +90,26 @@ def get_git_info() -> Tuple[str, str]:
             cwd=str(repo_dir),
             env=env,
         ).strip()
-        return branch, short_hash
+        # ISO-8601 strict commit datetime (e.g. 2025-10-28T23:41:12+02:00)
+        last_update_iso = subprocess.check_output(
+            ["git", "log", "-1", "--format=%cd", "--date=iso-strict"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            cwd=str(repo_dir),
+            env=env,
+        ).strip()
+        return branch, short_hash, last_update_iso
     except Exception:
-        return "unknown", "unknown"
+        # Fallback: use file mtime in local time as ISO string
+        try:
+            mtime = Path(__file__).stat().st_mtime
+            last_update_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(mtime))
+            # insert colon in timezone (+0200 -> +02:00) for ISO compliance
+            if len(last_update_iso) >= 24 and (last_update_iso[-5] in ["+", "-"]):
+                last_update_iso = last_update_iso[:-2] + ":" + last_update_iso[-2:]
+        except Exception:
+            last_update_iso = "unknown"
+        return "unknown", "unknown", last_update_iso
 
 
 def get_build_string() -> str:
@@ -100,8 +121,15 @@ def get_build_string() -> str:
             version = version_file.read_text(encoding="utf-8").strip()
     except Exception:
         pass
-    _, short_hash = get_git_info()
-    return f"v{version} ({short_hash})" if short_hash != "unknown" else f"v{version}"
+    branch, short_hash, last_update_iso = get_git_info()
+    core = f"v{version}"
+    if short_hash != "unknown":
+        core += f" ({short_hash})"
+    if branch != "unknown":
+        core += f" [{branch}]"
+    if last_update_iso != "unknown":
+        core += f" — updated {last_update_iso}"
+    return core
 
 
 # ---------------------------------------------------------------------------
@@ -1260,8 +1288,11 @@ class StrokeCounterApp:
         self.color_dual_mode.reset()
         self.status_var.set(f"Camera {index} active - waiting for ArUco markers...")
         self._schedule_update()
-        branch, short_hash = get_git_info()
-        print(f"[INFO] {APP_NAME} {self._build_string} — branch={branch} commit={short_hash}")
+        branch, short_hash, last_update_iso = get_git_info()
+        print(
+            f"[INFO] {APP_NAME} {self._build_string} — "
+            f"branch={branch} commit={short_hash} updated={last_update_iso}"
+        )
 
     def stop(self) -> None:
         self.running = False
@@ -2072,13 +2103,14 @@ class StrokeCounterApp:
             messagebox.showerror(APP_NAME, f"Failed to generate PDF: {exc}")
 
     def _show_about(self) -> None:
-        branch, short_hash = get_git_info()
+        branch, short_hash, last_update_iso = get_git_info()
         messagebox.showinfo(
             APP_NAME,
             f"Sofrim Stroke Counter\n"
             f"Build: {self._build_string}\n"
             f"Branch: {branch}\n"
-            f"Commit: {short_hash}\n\n"
+            f"Commit: {short_hash}\n"
+            f"Updated: {last_update_iso}\n\n"
             "Tracks a Torah scribe's quill to estimate writing strokes.\n"
             "Modes: Stripe, Rings, or Color dual-rings.\n"
             "Python 3.12 / OpenCV / Tkinter",
