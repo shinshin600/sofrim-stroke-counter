@@ -419,9 +419,9 @@ class ExponentialMovingAverage:
 
 
 class InkActivityTracker:
-    """Maintains a smoothed ink activity signal and pen state."""
+    """Maintains a smoothed ink activity signal and pen state, robust to ROI size changes."""
 
-    def __init__(self, window_size: int = 18, threshold_on: float = 3.5, threshold_off: float = 1.8):
+    def __init__(self, window_size: int = 18, threshold_on: float = 3.0, threshold_off: float = 1.5):
         self.window_size = int(window_size)
         self.threshold_on = float(threshold_on)
         self.threshold_off = float(threshold_off)
@@ -434,17 +434,31 @@ class InkActivityTracker:
         self.prev_roi = None
         self.pen_down = False
 
+    @staticmethod
+    def _prep(img: np.ndarray) -> np.ndarray:
+        """Normalise ROI to float grayscale and lightly denoise to reduce flicker."""
+
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        img = cv2.GaussianBlur(img, (3, 3), 0)
+        return img.astype(np.float32) / 255.0
+
     def update(self, roi_gray: Optional[np.ndarray]) -> Tuple[bool, float]:
         if roi_gray is None or roi_gray.size == 0:
             self.clear()
             return False, 0.0
 
-        activity = 0.0
-        if self.prev_roi is not None and self.prev_roi.shape == roi_gray.shape:
-            diff = cv2.absdiff(roi_gray, self.prev_roi)
-            activity = float(np.mean(diff))
+        cur = self._prep(roi_gray)
 
-        self.prev_roi = roi_gray.copy()
+        activity = 0.0
+        if self.prev_roi is not None:
+            prev_resized = cv2.resize(
+                self.prev_roi, (cur.shape[1], cur.shape[0]), interpolation=cv2.INTER_AREA
+            )
+            diff = cv2.absdiff(cur, prev_resized)
+            activity = float(diff.mean() * 255.0)
+
+        self.prev_roi = cur
         self.queue.append(activity)
         if len(self.queue) > self.window_size:
             self.queue.pop(0)
@@ -850,7 +864,9 @@ class StripeMode:
         ])
         roi_pts_px = self.homography.project_mm_to_px(offsets_mm)
         size_px = np.mean(np.abs(roi_pts_px[1] - roi_pts_px[0]))
-        size = int(max(4, size_px))
+        size = int(max(16, size_px))
+        q = 8
+        size = (size + q // 2) // q * q
         x = int(tip_px[0] - size)
         y = int(tip_px[1] - size)
         w = int(size * 2)
@@ -937,7 +953,9 @@ class RingsMode:
         ])
         roi_pts_px = self.homography.project_mm_to_px(offsets_mm)
         size_px = np.mean(np.abs(roi_pts_px[1] - roi_pts_px[0]))
-        size = int(max(4, size_px))
+        size = int(max(16, size_px))
+        q = 8
+        size = (size + q // 2) // q * q
         x = int(tip_px[0] - size)
         y = int(tip_px[1] - size)
         w = h = int(size * 2)
@@ -1087,7 +1105,9 @@ class ColorDualRingsMode:
         )
         roi_pts_px = self.homography.project_mm_to_px(offsets_mm)
         size_px = float(np.mean(np.abs(roi_pts_px[1] - roi_pts_px[0])))
-        size = int(max(6, size_px))
+        size = int(max(16, size_px))
+        q = 8
+        size = (size + q // 2) // q * q
         x = int(tip_px[0] - size)
         y = int(tip_px[1] - size)
         w = int(size * 2)
@@ -1438,6 +1458,27 @@ class StrokeCounterApp:
             (180, 255, 180),
             2,
         )
+
+        hud_scale = max(0.6, min(0.9, w / 1600.0))
+        cv2.putText(
+            overlay,
+            f"I:{activity:.1f}",
+            (14, int(58 * hud_scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hud_scale * 0.85,
+            (255, 255, 255),
+            2,
+        )
+        if pen_down:
+            cv2.putText(
+                overlay,
+                "PEN DOWN",
+                (w // 2 - 90, int(32 * hud_scale)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                hud_scale,
+                (0, 255, 255),
+                2,
+            )
 
         rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
