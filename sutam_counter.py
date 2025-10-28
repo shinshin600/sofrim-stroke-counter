@@ -393,7 +393,7 @@ class ExponentialMovingAverage:
 class InkActivityTracker:
     """Maintains a smoothed ink activity signal and pen state."""
 
-    def __init__(self, window_size: int = 12, threshold_on: float = 4.0, threshold_off: float = 2.0):
+    def __init__(self, window_size: int = 18, threshold_on: float = 3.5, threshold_off: float = 1.8):
         self.window_size = int(window_size)
         self.threshold_on = float(threshold_on)
         self.threshold_off = float(threshold_off)
@@ -971,8 +971,9 @@ class ColorDualRingsMode:
             self.reset()
             return result
 
-        roi = self._search_roi(frame.shape)
-        rx, ry, rw, rh = roi
+        # ראשית: חפש באזור גדול כדי למצוא טבעות
+        roi_search = self._search_roi(frame.shape)
+        rx, ry, rw, rh = roi_search
         frame_roi = frame[ry : ry + rh, rx : rx + rw]
 
         hsv = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2HSV)
@@ -995,7 +996,7 @@ class ColorDualRingsMode:
             or magenta_area < self.config.min_area_px
         ):
             self.lost_counter += 1
-            return self._hold_last(result, roi)
+            return self._hold_last(result, roi_search)
 
         cyan_center_px = cyan_center_roi + np.array([rx, ry], dtype=float)
         magenta_center_px = magenta_center_roi + np.array([rx, ry], dtype=float)
@@ -1006,11 +1007,11 @@ class ColorDualRingsMode:
         axis_mm = normalise(cyan_center_mm - magenta_center_mm)
         if np.allclose(axis_mm, 0):
             self.lost_counter += 1
-            return self._hold_last(result, roi)
+            return self._hold_last(result, roi_search)
 
         if not angle_consistent(axis_mm, self.prev_line_dir_mm, self.config.angle_gate_deg):
             self.lost_counter += 1
-            return self._hold_last(result, roi)
+            return self._hold_last(result, roi_search)
 
         normal_mm = np.array([-axis_mm[1], axis_mm[0]], dtype=float)
         if self.config.nib_side.lower() == "right":
@@ -1026,7 +1027,7 @@ class ColorDualRingsMode:
         if self.prev_tip_mm is not None:
             if float(np.linalg.norm(tip_mm_new - self.prev_tip_mm)) > float(self.config.max_jump_mm):
                 self.lost_counter += 1
-                return self._hold_last(result, roi)
+                return self._hold_last(result, roi_search)
 
         tip_mm_smooth = self.tip_filter.update(tip_mm_new)
         tip_px = self.homography.project_mm_to_px(tip_mm_smooth.reshape(1, 2))[0]
@@ -1039,9 +1040,33 @@ class ColorDualRingsMode:
         result.tip_mm = tip_mm_smooth
         result.cyan_center_px = cyan_center_px
         result.magenta_center_px = magenta_center_px
-        result.roi = roi
+        # עכשיו: קבע ROI קטן סביב החוד כדי שחיישן הדיו ימדוד רק "דיו" ולא את כל החלון הגדול
+        small_roi = self._roi_from_tip(frame, tip_px, tip_mm_smooth)
+        result.roi = small_roi if small_roi is not None else roi_search
         self.last_result = result
         return result
+
+    def _roi_from_tip(
+        self, frame: np.ndarray, tip_px: np.ndarray, tip_mm: np.ndarray
+    ) -> Optional[Tuple[int, int, int, int]]:
+        # דומה ל-rings/stripe: חלון קטן סביב החוד, בקירוב ~5 מ"מ
+        if not self.homography.ready:
+            return None
+        radius_mm = 5.0
+        offsets_mm = np.array(
+            [tip_mm + [-radius_mm, -radius_mm], tip_mm + [radius_mm, radius_mm]],
+            dtype=float,
+        )
+        roi_pts_px = self.homography.project_mm_to_px(offsets_mm)
+        size_px = float(np.mean(np.abs(roi_pts_px[1] - roi_pts_px[0])))
+        size = int(max(6, size_px))
+        x = int(tip_px[0] - size)
+        y = int(tip_px[1] - size)
+        w = int(size * 2)
+        h = int(size * 2)
+        if x < 0 or y < 0 or x + w >= frame.shape[1] or y + h >= frame.shape[0]:
+            return None
+        return (x, y, w, h)
 
     def _largest_centroid_and_area(
         self, mask: np.ndarray
@@ -1128,7 +1153,8 @@ class StrokeCounterApp:
         self.color_dual_mode = ColorDualRingsMode(
             self.config.color_dual_rings, self.marker_homography
         )
-        self.ink_tracker = InkActivityTracker()
+        # חיישן דיו רגיש מעט יותר (מתאים ל-ROI קטן סביב החוד)
+        self.ink_tracker = InkActivityTracker(window_size=18, threshold_on=3.5, threshold_off=1.8)
         self.stroke_count = 0
         self.refine_count = 0
         self.last_tip_mm: Optional[np.ndarray] = None
