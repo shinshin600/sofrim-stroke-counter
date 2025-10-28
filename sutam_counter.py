@@ -1153,8 +1153,8 @@ class StrokeCounterApp:
         self.color_dual_mode = ColorDualRingsMode(
             self.config.color_dual_rings, self.marker_homography
         )
-        # חיישן דיו רגיש מעט יותר (מתאים ל-ROI קטן סביב החוד)
-        self.ink_tracker = InkActivityTracker(window_size=18, threshold_on=3.5, threshold_off=1.8)
+        # More sensitive ink detection so שתראה PEN DOWN גם בתנועות קטנות
+        self.ink_tracker = InkActivityTracker(window_size=18, threshold_on=2.0, threshold_off=1.0)
         self.stroke_count = 0
         self.refine_count = 0
         self.last_tip_mm: Optional[np.ndarray] = None
@@ -1366,7 +1366,8 @@ class StrokeCounterApp:
             cv2.circle(overlay, tuple(int(v) for v in tip_px), 6, (0, 0, 255), -1)
         if result.roi is not None:
             x, y, w, h = result.roi
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), (255, 255, 0), 1)
+            # קו עבה יותר כדי שלא “ייעלם” על המסך
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), (255, 255, 0), 2)
 
         # Compact, scalable HUD (prevents clipping on small windows)
         h, w = overlay.shape[:2]
@@ -1384,7 +1385,8 @@ class StrokeCounterApp:
         font_scale = 0.7 * (w / 1280.0)
         font_scale = max(0.5, min(font_scale, 0.9))  # clamp for typical laptops
 
-        status_text = f"{self.config.mode}  S:{self.stroke_count}  R:{self.refine_count}  I:{activity:.1f}"
+        pd_flag = "  PEN DOWN" if pen_down else ""
+        status_text = f"{self.config.mode}  S:{self.stroke_count}  R:{self.refine_count}  I:{activity:.1f}{pd_flag}"
         cv2.putText(
             overlay,
             status_text,
